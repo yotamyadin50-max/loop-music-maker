@@ -613,27 +613,21 @@ function initStudio() {
    picked from the existing low-to-high drum palette, not new sounds. Progression: a plain pulse,
    then the kick/snare backbeat every real beat is built on, then syncopation, then a second
    simultaneous voice (hihat) as continuous texture, then all three woven together. */
-const LESSONS = [
+const DRUM_PATTERNS = [
   {
     name: "פעימה פשוטה",
     desc: "רק קיק, על כל פעימה. זו הבסיס של כל קצב.",
-    hits: [
-      [0, 2], [2, 2], [4, 2], [6, 2],
-    ],
+    hits: [[0, 2], [2, 2], [4, 2], [6, 2]],
   },
   {
     name: "קיק וסנר",
     desc: "קיק בהתחלה, סנר באמצע. זה בדיוק המבנה של רוב השירים שאתה מכיר.",
-    hits: [
-      [0, 2], [4, 2], [2, 18], [6, 18],
-    ],
+    hits: [[0, 2], [4, 2], [2, 18], [6, 18]],
   },
   {
     name: "קיק מסונקף",
     desc: "עוד שתי הקשות קיק, לא בדיוק על הפעימה. זה מה שנותן לקצב תחושת \"קפיצה\".",
-    hits: [
-      [0, 2], [3, 2], [4, 2], [7, 2], [2, 18], [6, 18],
-    ],
+    hits: [[0, 2], [3, 2], [4, 2], [7, 2], [2, 18], [6, 18]],
   },
   {
     name: "הוספת הייהאט",
@@ -652,6 +646,52 @@ const LESSONS = [
       [1, 29], [3, 29], [5, 29], [7, 29],
     ],
   },
+];
+
+/* Five piano phrases, each paired 1:1 with the DRUM_PATTERNS lesson of the same slot: the drum
+   loop is the given foundation (already playing, per direct instruction "you create the drums
+   there and then learn to add the piano on top of it"), and the lesson teaches the melodic
+   phrase that sits on top of it. Tiles 8-15 = one octave (C4-C5) of the existing piano scale,
+   a comfortable, singable middle range, not a new sound. Progression mirrors the drum side:
+   landing exactly on the kick, a simple call-and-response, one syncopated note, a longer
+   5-note phrase, then a fully off-the-beat line with no easy anchor. */
+const PIANO_PHRASES = [
+  {
+    name: "מלודיה על הקיק",
+    desc: "שלוש תווים עולים, בדיוק על אותם רגעים שהקיק כבר מכה. הכי קל להתחיל איתו.",
+    hits: [[0, 8], [2, 10], [4, 12], [6, 15]],
+  },
+  {
+    name: "שאלה ותשובה",
+    desc: "תו יורד, אז תו עולה בחזרה. עונה לקיק ולסנר, לא רק חוזר עליהם.",
+    hits: [[0, 12], [2, 10], [4, 8], [6, 10]],
+  },
+  {
+    name: "תו אחד מחוץ לביט",
+    desc: "כמעט אותו דבר, אבל תו אחד לא נופל בדיוק על שום דבר בתופים. זה מה שמלמד אותך לנגן עם הביט, לא רק לצידו.",
+    hits: [[0, 8], [3, 12], [5, 10], [7, 8]],
+  },
+  {
+    name: "מלודיה מלאה",
+    desc: "חמישה תווים על פני כל התיבה, כמו הייהאט שממלא את הקצב בתופים.",
+    hits: [[0, 8], [1, 9], [2, 10], [4, 12], [6, 11]],
+  },
+  {
+    name: "מלודיה חופשית",
+    desc: "השיעור הכי קשה: אף תו לא על פעימה ברורה. תקשיב הרבה פעמים לפני שתנסה.",
+    hits: [[1, 10], [2, 12], [4, 15], [5, 13], [7, 12]],
+  },
+];
+
+const LESSONS = [
+  ...DRUM_PATTERNS.map((p) => ({ instrument: "drums", name: p.name, desc: p.desc, hits: p.hits, backing: null })),
+  ...PIANO_PHRASES.map((p, i) => ({
+    instrument: "piano",
+    name: p.name,
+    desc: p.desc,
+    hits: p.hits,
+    backing: DRUM_PATTERNS[i].hits,
+  })),
 ];
 const LESSON_STEP_SECONDS = 0.35;
 const LS_LESSON_PROGRESS_KEY = "paama-lesson-progress-v1";
@@ -709,7 +749,9 @@ function initLessons() {
   const demoTracker = createNodeTracker();
   const pickerChips = [];
 
-  /* lesson picker chips, 1-5, each with a difficulty-dot readout and a done-checkmark once practiced */
+  /* lesson picker chips: two tracks of 5 (drums 1-5, then piano 6-10), each chip's dots show
+     difficulty WITHIN its own track (piano lesson 1 shows 1 dot, same as drum lesson 1), a
+     done-checkmark appears once that lesson has at least one successful practice repeat. */
   LESSONS.forEach((lesson, i) => {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -718,9 +760,10 @@ function initLessons() {
     label.textContent = "שיעור " + (i + 1);
     const dots = document.createElement("span");
     dots.className = "lessons__picker-btn__dots";
+    const diffInTrack = i % 5;
     for (let d = 0; d < 5; d++) {
       const dot = document.createElement("span");
-      if (d <= i) dot.classList.add("is-filled");
+      if (d <= diffInTrack) dot.classList.add("is-filled");
       dots.appendChild(dot);
     }
     const check = document.createElement("span");
@@ -740,6 +783,9 @@ function initLessons() {
   }
   refreshPickerProgress();
 
+  const backingTracker = createNodeTracker();
+  let backingTimer = null;
+
   function buildGrid() {
     gridEl.innerHTML = "";
     pads = [];
@@ -747,7 +793,6 @@ function initLessons() {
       const pad = document.createElement("button");
       pad.type = "button";
       pad.className = "pad";
-      pad.setAttribute("aria-label", "פד " + (i + 1) + ", תופים");
       pad.addEventListener("pointerdown", () => onPracticeTap(i));
       gridEl.appendChild(pad);
       pads.push(pad);
@@ -755,18 +800,51 @@ function initLessons() {
   }
   buildGrid();
 
+  function stopBacking() {
+    if (backingTimer) clearTimeout(backingTimer);
+    backingTimer = null;
+    backingTracker.stopAll();
+  }
+
+  /* the drum foundation for a piano lesson loops continuously and independently in the
+     background while that lesson is open, per direct instruction: "you create the drums
+     there, then learn to add the piano on top of it." Practice taps don't need to be
+     phase-locked to it (the sequence check below only cares about tile ORDER, not exact
+     timing), this is for real musical context, hearing the phrase over an actual beat. */
+  function startBacking(backingHits) {
+    stopBacking();
+    const ctx = ensureAudio();
+    let iteration = 0;
+    const measureLen = 8 * LESSON_STEP_SECONDS;
+    const startAt = ctx.currentTime + 0.05;
+    function scheduleIteration() {
+      const iterStart = startAt + iteration * measureLen;
+      for (const [step, tile] of backingHits) {
+        const nodes = triggerSound("drums", tile, iterStart + step * LESSON_STEP_SECONDS);
+        backingTracker.track("backing", nodes);
+      }
+      iteration++;
+      backingTimer = setTimeout(scheduleIteration, measureLen * 1000 - 30);
+    }
+    scheduleIteration();
+  }
+
   function loadLesson(i) {
     lessonIndex = i;
     const lesson = LESSONS[i];
-    titleEl.textContent = "שיעור " + (i + 1) + " מתוך " + LESSONS.length + ": " + lesson.name;
+    const trackLabel = lesson.instrument === "piano" ? "פסנתר" : "תופים";
+    titleEl.textContent = "שיעור " + (i + 1) + " מתוך " + LESSONS.length + " (" + trackLabel + "): " + lesson.name;
     descEl.textContent = lesson.desc;
     diffEl.innerHTML = "";
+    const diffInTrack = (i % 5) + 1;
     for (let d = 1; d <= 5; d++) {
       const dot = document.createElement("span");
-      if (d <= i + 1) dot.classList.add("is-filled");
+      if (d <= diffInTrack) dot.classList.add("is-filled");
       diffEl.appendChild(dot);
     }
     [...picker.children].forEach((btn, idx) => btn.classList.toggle("lessons__picker-btn--active", idx === i));
+
+    pads.forEach((pad, idx) => pad.setAttribute("aria-label", "פד " + (idx + 1) + ", " + trackLabel));
 
     /* the sequence to match, sorted by step so "same order" means the same rhythmic order */
     expectedSequence = [...lesson.hits].sort((a, b) => a[0] - b[0]).map((h) => h[1]);
@@ -775,26 +853,38 @@ function initLessons() {
     repeatCountEl.textContent = "0";
     rewardEl.hidden = true;
     openStudioBtn.hidden = true;
-    statusEl.textContent = "עכשיו התור שלך: תקיש על אותם פדים, באותו סדר.";
+    statusEl.textContent = lesson.backing
+      ? "התופים כבר מנגנים ברקע. עכשיו התור שלך: תוסיף את הפסנתר, באותו סדר."
+      : "עכשיו התור שלך: תקיש על אותם פדים, באותו סדר.";
     pads.forEach((p) => p.classList.remove("pad--target"));
     prevBtn.disabled = i === 0;
     nextBtn.disabled = i === LESSONS.length - 1;
+
+    if (lesson.backing) startBacking(lesson.backing);
+    else stopBacking();
   }
 
   function playLesson() {
     const ctx = ensureAudio();
     demoTracker.stopAll();
+    const lesson = LESSONS[lessonIndex];
     const stepSeconds = slowToggle.checked ? LESSON_STEP_SECONDS * 1.8 : LESSON_STEP_SECONDS;
+    /* a synced, self-contained demo pass: pause the ambient backing loop for a clean listen,
+       play backing (if any) plus the phrase together from a shared step 0, then resume the
+       ambient loop once the pass ends, avoiding any phase-drift between the two. */
+    if (lesson.backing) stopBacking();
     const startAt = ctx.currentTime + 0.05;
-    for (const [step, tile] of LESSONS[lessonIndex].hits) {
+    const allHits = lesson.backing ? [...lesson.backing.map(([s, t]) => [s, t, "drums"]), ...lesson.hits.map(([s, t]) => [s, t, lesson.instrument])] : lesson.hits.map(([s, t]) => [s, t, lesson.instrument]);
+    for (const [step, tile, instrument] of allHits) {
       const when = startAt + step * stepSeconds;
-      const nodes = triggerSound("drums", tile, when);
+      const nodes = triggerSound(instrument, tile, when);
       demoTracker.track("demo", nodes);
       const delayMs = Math.max(0, (when - ctx.currentTime) * 1000);
       setTimeout(() => {
         const pad = pads[tile];
-        pad.classList.add("pad--drums-lit");
-        setTimeout(() => pad.classList.remove("pad--drums-lit"), 140);
+        const cls = instrument === "piano" ? "pad--piano-lit" : "pad--drums-lit";
+        pad.classList.add(cls);
+        setTimeout(() => pad.classList.remove(cls), 140);
       }, delayMs);
     }
     /* a plain beat count (1..8), not tied to whether that step has a hit, so the visitor
@@ -806,18 +896,22 @@ function initLessons() {
         beatCounterEl.textContent = String(step + 1);
       }, delayMs);
     }
+    const endDelayMs = (startAt + 8 * stepSeconds - ctx.currentTime) * 1000;
     setTimeout(() => {
       beatCounterEl.textContent = "";
-    }, (startAt + 8 * stepSeconds - ctx.currentTime) * 1000);
+      if (lesson.backing) startBacking(lesson.backing); /* resume the ambient loop for practice */
+    }, endDelayMs);
   }
   demoBtn.addEventListener("click", playLesson);
 
   function onPracticeTap(tileIndex) {
     const ctx = ensureAudio();
-    triggerSound("drums", tileIndex, ctx.currentTime);
+    const lesson = LESSONS[lessonIndex];
+    triggerSound(lesson.instrument, tileIndex, ctx.currentTime);
     const pad = pads[tileIndex];
-    pad.classList.add("pad--drums-lit");
-    setTimeout(() => pad.classList.remove("pad--drums-lit"), 140);
+    const litCls = lesson.instrument === "piano" ? "pad--piano-lit" : "pad--drums-lit";
+    pad.classList.add(litCls);
+    setTimeout(() => pad.classList.remove(litCls), 140);
 
     if (tileIndex === expectedSequence[userProgress]) {
       userProgress++;
@@ -841,22 +935,25 @@ function initLessons() {
 
   addToLoopBtn.addEventListener("click", () => {
     const lesson = LESSONS[lessonIndex];
-    const loopData = {
-      loopLength: 8 * LESSON_STEP_SECONDS,
-      layers: [
-        {
-          instrument: "drums",
-          notes: lesson.hits.map(([step, tile]) => ({ tileIndex: tile, time: step * LESSON_STEP_SECONDS })),
-          muted: false,
-          gain: 1,
-          joinIteration: 0,
-        },
-      ],
-    };
+    const toLayer = (hits, instrument) => ({
+      instrument,
+      notes: hits.map(([step, tile]) => ({ tileIndex: tile, time: step * LESSON_STEP_SECONDS })),
+      muted: false,
+      gain: 1,
+      joinIteration: 0,
+    });
+    const layers = lesson.backing
+      ? [toLayer(lesson.backing, "drums"), toLayer(lesson.hits, "piano")]
+      : [toLayer(lesson.hits, lesson.instrument)];
+    const loopData = { loopLength: 8 * LESSON_STEP_SECONDS, layers };
     const encoded = encodeLoop(loopData);
     openStudioBtn.href = "studio.html?share=" + encoded;
     openStudioBtn.hidden = false;
-    showListToast("נוסף! תלחץ \"פתח בסטודיו\" כדי להמשיך לבנות עליו.");
+    showListToast(
+      lesson.backing
+        ? "נוסף! שני הכלים ביחד. תלחץ \"פתח בסטודיו\" כדי להמשיך לבנות עליו."
+        : "נוסף! תלחץ \"פתח בסטודיו\" כדי להמשיך לבנות עליו."
+    );
   });
 
   prevBtn.addEventListener("click", () => {
