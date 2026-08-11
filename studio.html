@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>סטודיו, פעימה</title>
+  <meta name="description" content="לוח 32 פדים, תופים ופסנתר, בלי מטרונום. מקישים, סוגרים ללופ, מוסיפים שכבה." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230F1115'/%3E%3Ccircle cx='16' cy='16' r='9' fill='%23F5C24C'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Secular+One&family=Rubik:wght@400;500;600&family=Space+Grotesk:wght@500&subset=hebrew&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="studio">
+  <header class="site-header">
+    <a class="site-header__logo" href="index.html">פעימה</a>
+    <nav class="site-header__nav">
+      <a class="site-header__link" href="index.html">בית</a>
+      <a class="site-header__link" href="studio.html">סטודיו</a>
+      <a class="site-header__link" href="lessons.html">שיעורים</a>
+      <a class="site-header__link" href="my-loops.html">הלופים שלי</a>
+    </nav>
+  </header>
+
+  <main class="app-shell studio" data-studio>
+    <div class="transport">
+      <button type="button" class="btn btn--accent" data-action="start">התחל</button>
+      <span class="armed-status" data-armed-status hidden>מקשיב...</span>
+      <button type="button" class="btn btn--accent" data-action="enter-loop" disabled>הכנס ללופ</button>
+      <span class="transport__layers">שכבות פעילות: <span data-layer-count>0</span></span>
+    </div>
+
+    <div class="banner" data-banner hidden></div>
+
+    <div class="instrument-picker">
+      <button type="button" class="instrument-picker__btn instrument-picker__btn--drums" data-instrument="drums">תופים</button>
+      <button type="button" class="instrument-picker__btn instrument-picker__btn--piano" data-instrument="piano">פסנתר</button>
+    </div>
+
+    <div class="grid-wrap">
+      <div class="lock-ring"></div>
+      <div class="pad-grid"></div>
+      <div class="playhead-track" aria-hidden="true"><div class="playhead-track__fill"></div></div>
+
+      <div class="onboarding-tip" data-onboarding style="top: -70px; right: 0;">
+        תלחץ כאן כדי להתחיל להקשיב
+        <a href="#" class="onboarding-tip__skip" data-skip>דלג</a>
+      </div>
+    </div>
+
+    <aside class="layers-panel" data-layers-panel>
+      <p class="layers-panel__title">שכבות</p>
+    </aside>
+
+    <div class="action-row">
+      <button type="button" class="btn btn--outline" data-action="save">שמור לופ</button>
+      <button type="button" class="btn btn--error" data-action="restart">התחל מחדש</button>
+    </div>
+  </main>
+
+  <div class="block-screen">
+    <span class="block-screen__logo">פעימה</span>
+    <p class="block-screen__text">הכלי הזה בנוי לשימוש בטאבלט או מחשב, המסך שלך צר מדי כרגע.</p>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
