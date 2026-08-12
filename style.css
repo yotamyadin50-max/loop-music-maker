@@ -307,11 +307,14 @@
   .layer-card__btn--muted { color: var(--color-error); }
 
   .layer-card__trim { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-3); padding-top: var(--space-2); border-top: 1px solid var(--color-surface-raised); }
-  .layer-card__trim-group { display: flex; align-items: center; gap: 4px; }
+  .layer-card__trim-group { display: flex; align-items: center; gap: 6px; }
   .layer-card__trim-label { font-size: 11px; color: var(--color-muted); white-space: nowrap; }
   .layer-card__trim-value { min-width: 36px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--color-ink); }
   .layer-card__trim-value--length { font-weight: 600; color: var(--color-accent); }
-  .layer-card__trim-btn { width: 22px; height: 22px; min-height: 0; padding: 0; border-radius: 4px; font-size: 13px; line-height: 1; }
+  /* matches .layer-card__btn's own 32px: the original 22px was well under this app's own
+     44px touch-target standard (see .btn--icon), a real problem on the tablets this is built
+     for. 32px is the best fit the tight 300px panel allows without breaking the layout. */
+  .layer-card__trim-btn { width: 32px; height: 32px; min-height: 0; padding: 0; border-radius: 4px; font-size: 15px; line-height: 1; }
 
   .action-row { grid-column: 1 / -1; display: flex; gap: var(--space-3); justify-content: flex-end; }
 
