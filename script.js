@@ -238,6 +238,8 @@ function initStudio() {
   const startBtn = root.querySelector("[data-action='start']");
   const enterLoopBtn = root.querySelector("[data-action='enter-loop']");
   const layerCountEl = root.querySelector("[data-layer-count]");
+  const currentRoundWrapEl = root.querySelector("[data-current-round-wrap]");
+  const currentRoundEl = root.querySelector("[data-current-round]");
   const instrumentBtns = root.querySelectorAll("[data-instrument]");
   const layersPanel = root.querySelector("[data-layers-panel]");
   const saveBtn = root.querySelector("[data-action='save']");
@@ -374,7 +376,10 @@ function initStudio() {
       const last = pendingTaps[pendingTaps.length - 1];
       const gap0 = first.absTime - armedAt;
       loopStartTime = armedAt;
-      loopLength = last.absTime - armedAt + gap0;
+      /* floor at 0.3s: a real human can't close a loop faster than that, and every recursive
+         preview/playback scheduler below times its own delay off loopLength, so a near-zero
+         value would spin them in a runaway near-0ms setTimeout loop and freeze the tab. */
+      loopLength = Math.max(0.3, last.absTime - armedAt + gap0);
       layers.push({
         instrument: currentInstrument,
         notes: pendingTaps.map((t) => ({ tileIndex: t.tileIndex, time: t.absTime - armedAt })),
@@ -506,6 +511,13 @@ function initStudio() {
        layer's join round), so loopStartTime must sit maxJoin*loopLength in the PAST for that
        iteration's start time to land on "now" instead of maxJoin loops in the future. */
     if (loopStartTime === null) return;
+    if (previewMode) {
+      /* any live edit (trim, join round, loop length) drops back to normal editing, same rule
+         as "התחל": preview and the live editing engine must never both be scheduling at once,
+         or notes double up. */
+      previewMode = false;
+      stopPreviewPlayback();
+    }
     stopScheduler();
     nodeTracker.stopAll();
     const maxJoin = layers.reduce((m, l) => Math.max(m, l.joinIteration || 0), 0);
@@ -564,7 +576,7 @@ function initStudio() {
         }
       }
       iteration++;
-      setTimeout(scheduleIteration, loopLength * 1000 - 30);
+      setTimeout(scheduleIteration, Math.max(50, loopLength * 1000 - 30)); /* floor: never re-enter faster than 50ms, however small loopLength is */
     }
     scheduleIteration();
   }
@@ -620,14 +632,20 @@ function initStudio() {
     playheadTimer = setInterval(() => {
       if (loopStartTime === null) return;
       const ctx = ensureAudio();
-      const progress = ((ctx.currentTime - loopStartTime) % loopLength) / loopLength;
+      const elapsed = ctx.currentTime - loopStartTime;
+      const progress = (elapsed % loopLength) / loopLength;
       playheadFill.style.width = Math.max(0, Math.min(1, progress)) * 100 + "%";
+      /* the same iteration count the scheduler itself uses for joinIteration comparisons,
+         surfaced so "מצטרף בסיבוב" on a layer card means something concrete while editing. */
+      currentRoundWrapEl.hidden = false;
+      currentRoundEl.textContent = String(Math.max(0, Math.floor(elapsed / loopLength)));
     }, 50);
   }
   function stopPlayhead() {
     if (playheadTimer) clearInterval(playheadTimer);
     playheadTimer = null;
     playheadFill.style.width = "0%";
+    currentRoundWrapEl.hidden = true;
   }
   function schedulerTick() {
     if (loopStartTime === null) return;
@@ -1411,7 +1429,7 @@ function initMyLoops() {
           }
         }
         iteration++;
-        setTimeout(scheduleIteration, loopLength * 1000 - 30);
+        setTimeout(scheduleIteration, Math.max(50, loopLength * 1000 - 30)); /* floor: never re-enter faster than 50ms, however small loopLength is */
       }
       scheduleIteration();
     }
