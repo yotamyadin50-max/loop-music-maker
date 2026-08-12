@@ -744,11 +744,25 @@ function initStudio() {
       startValue.className = "layer-card__trim-value";
       const endValue = document.createElement("span");
       endValue.className = "layer-card__trim-value";
+      const lengthValue = document.createElement("span");
+      lengthValue.className = "layer-card__trim-value layer-card__trim-value--length";
       function refreshTrimValues() {
         startValue.textContent = (layer.activeFrom || 0).toFixed(1) + " שנ'";
         endValue.textContent = Math.max(0, loopLength - currentTo()).toFixed(1) + " שנ'";
+        lengthValue.textContent = Math.max(0, currentTo() - (layer.activeFrom || 0)).toFixed(1) + " שנ'";
       }
       refreshTrimValues();
+
+      /* the resulting playing time of THIS layer's own loop, after both trims: a plain readout,
+         no +/- of its own since it's fully derived from the start/end cuts above, per direct
+         request to also show "the time of each loop" alongside the cutting controls. */
+      const lengthGroup = document.createElement("div");
+      lengthGroup.className = "layer-card__trim-group";
+      const lengthLabel = document.createElement("span");
+      lengthLabel.className = "layer-card__trim-label";
+      lengthLabel.textContent = "אורך השכבה";
+      lengthGroup.append(lengthLabel, lengthValue);
+      trimRow.append(lengthGroup);
 
       const startGroup = document.createElement("div");
       startGroup.className = "layer-card__trim-group";
@@ -1375,7 +1389,7 @@ function initMyLoops() {
     date.textContent = formatDate(entry.createdAt);
 
     const label = document.createElement("span");
-    label.textContent = entry.loop.layers.length + " שכבות";
+    label.textContent = entry.loop.layers.length + " שכבות, " + entry.loop.loopLength.toFixed(1) + " שנ'";
 
     const actions = document.createElement("div");
     actions.className = "loop-card__actions";

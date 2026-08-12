@@ -304,6 +304,7 @@
   .layer-card__trim-group { display: flex; align-items: center; gap: 4px; }
   .layer-card__trim-label { font-size: 11px; color: var(--color-muted); white-space: nowrap; }
   .layer-card__trim-value { min-width: 36px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--color-ink); }
+  .layer-card__trim-value--length { font-weight: 600; color: var(--color-accent); }
   .layer-card__trim-btn { width: 22px; height: 22px; min-height: 0; padding: 0; border-radius: 4px; font-size: 13px; line-height: 1; }
 
   .action-row { grid-column: 1 / -1; display: flex; gap: var(--space-3); justify-content: flex-end; }
