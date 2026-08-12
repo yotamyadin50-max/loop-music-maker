@@ -827,6 +827,27 @@ function initStudio() {
         nodeTracker.stop(layer); /* real delete stops sound immediately, not just after the current pass finishes */
         previewTracker.stop(layer); /* same, for whichever engine (live or preview) happens to be running */
         layers.splice(i, 1);
+        if (layers.length === 0) {
+          /* nothing left to loop: the next recording must start a fresh master grid, not
+             silently inherit the deleted loop's clock and quantize itself as if joining a loop
+             that no longer exists. Found via testing: delete-the-only-layer then record a new
+             one produced a nonzero joinAt against a stale loopStartTime. Same reset as "התחל
+             מחדש", minus the confirm (deleting the last layer one at a time already was it). */
+          stopPreviewPlayback();
+          previewMode = false;
+          previewPanelEl.hidden = true;
+          previewHintEl.hidden = true;
+          stopScheduler();
+          loopStartTime = null;
+          loopLength = null;
+          editingLoopId = null;
+          lockRing.classList.remove("lock-ring--pulsing");
+          lockRing.style.opacity = "0";
+          if (banner) banner.hidden = true;
+          updateLoopTrimDisplay();
+        } else {
+          syncMasterGrid(); /* whichever layer is now layers[0] (possibly a different one, if index 0 was deleted) defines the master grid */
+        }
         renderLayers();
       });
       const topRow = document.createElement("div");
