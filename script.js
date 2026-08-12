@@ -381,6 +381,8 @@ function initStudio() {
         muted: false,
         gain: 1,
         joinIteration: 0, /* already playing live from the start, no wait */
+        activeFrom: 0,
+        activeTo: loopLength,
       });
       scheduledUpToIteration = 0; /* iteration 0 already played live */
       startScheduler();
@@ -397,6 +399,8 @@ function initStudio() {
         muted: false,
         gain: 1,
         joinIteration: scheduledUpToIteration + 1,
+        activeFrom: 0,
+        activeTo: loopLength,
       });
     }
     pendingTaps = [];
@@ -495,19 +499,26 @@ function initStudio() {
     if (value !== null) applyLoopLength(value);
   });
 
+  function reanchorLive() {
+    /* re-anchor the clock without discarding each layer's real joinIteration (still the source
+       of truth for the build-up order once saved), so everyone already-present plays together
+       immediately while actively editing. The next iteration to schedule is maxJoin (the last
+       layer's join round), so loopStartTime must sit maxJoin*loopLength in the PAST for that
+       iteration's start time to land on "now" instead of maxJoin loops in the future. */
+    if (loopStartTime === null) return;
+    stopScheduler();
+    nodeTracker.stopAll();
+    const maxJoin = layers.reduce((m, l) => Math.max(m, l.joinIteration || 0), 0);
+    scheduledUpToIteration = maxJoin - 1;
+    loopStartTime = ensureAudio().currentTime + 0.05 - maxJoin * loopLength;
+    startScheduler();
+  }
+
   function applyLoopLength(newLength) {
     if (newLength === null || Number.isNaN(newLength)) return;
     const floor = latestNoteEnd() + 0.05;
     loopLength = Math.max(floor, Math.round(newLength * 10) / 10);
-    stopScheduler();
-    nodeTracker.stopAll();
-    loopStartTime = ensureAudio().currentTime + 0.05;
-    /* re-anchor the clock without discarding each layer's real joinIteration (still the source
-       of truth for the build-up order once saved), just let everyone already-present play
-       together immediately while actively editing. */
-    const maxJoin = layers.reduce((m, l) => Math.max(m, l.joinIteration || 0), 0);
-    scheduledUpToIteration = maxJoin - 1;
-    startScheduler();
+    reanchorLive();
     updateLoopTrimDisplay();
   }
   trimShorterBtn.addEventListener("click", () => {
@@ -542,7 +553,10 @@ function initStudio() {
       for (const layer of layers) {
         if (layer.muted) continue;
         if (iteration < (layer.joinIteration || 0)) continue; /* the real build-up order */
+        const from = layer.activeFrom || 0;
+        const to = layer.activeTo == null ? loopLength : Math.min(layer.activeTo, loopLength);
         for (const note of layer.notes) {
+          if (note.time < from || note.time > to) continue;
           const nodes = triggerSound(layer.instrument, note.tileIndex, iterStart + note.time, layer.gain);
           previewTracker.track(layer, nodes);
           const delayMs = Math.max(0, iterStart + note.time - ctx.currentTime) * 1000;
@@ -569,9 +583,7 @@ function initStudio() {
     previewMode = false;
     stopPreviewPlayback();
     /* back to normal live editing: everyone already recorded plays together again immediately */
-    const maxJoin = layers.reduce((m, l) => Math.max(m, l.joinIteration || 0), 0);
-    scheduledUpToIteration = maxJoin - 1;
-    startScheduler();
+    reanchorLive();
   }
 
   previewPlayBtn.addEventListener("click", () => {
@@ -627,7 +639,10 @@ function initStudio() {
       for (const layer of layers) {
         if (layer.muted) continue;
         if (iterIndex < (layer.joinIteration || 0)) continue; /* not joined yet, per the chosen 1-round rule */
+        const from = layer.activeFrom || 0;
+        const to = layer.activeTo == null ? loopLength : Math.min(layer.activeTo, loopLength);
         for (const note of layer.notes) {
+          if (note.time < from || note.time > to) continue; /* trimmed off this layer's own start/end */
           const when = iterStart + note.time;
           const nodes = triggerSound(layer.instrument, note.tileIndex, when, layer.gain);
           nodeTracker.track(layer, nodes);
@@ -693,7 +708,125 @@ function initStudio() {
         layers.splice(i, 1);
         renderLayers();
       });
-      card.append(dot, name, volume, muteBtn, delBtn);
+      const topRow = document.createElement("div");
+      topRow.className = "layer-card__top";
+      topRow.append(dot, name, volume, muteBtn, delBtn);
+
+      /* per-layer trim: independent start/end cut for THIS sound's own loop window,
+         on top of the shared loop length, per direct request. Shown as "how much cut",
+         matching the user's own words ("remove time from the start and from the end"). */
+      const TRIM_STEP = 0.1;
+      const trimRow = document.createElement("div");
+      trimRow.className = "layer-card__trim";
+
+      function currentTo() {
+        return layer.activeTo == null ? loopLength : layer.activeTo;
+      }
+      const startValue = document.createElement("span");
+      startValue.className = "layer-card__trim-value";
+      const endValue = document.createElement("span");
+      endValue.className = "layer-card__trim-value";
+      function refreshTrimValues() {
+        startValue.textContent = (layer.activeFrom || 0).toFixed(1) + " שנ'";
+        endValue.textContent = Math.max(0, loopLength - currentTo()).toFixed(1) + " שנ'";
+      }
+      refreshTrimValues();
+
+      const startGroup = document.createElement("div");
+      startGroup.className = "layer-card__trim-group";
+      const startLabel = document.createElement("span");
+      startLabel.className = "layer-card__trim-label";
+      startLabel.textContent = "חיתוך מההתחלה";
+      const startMinus = document.createElement("button");
+      startMinus.type = "button";
+      startMinus.className = "btn btn--outline btn--icon layer-card__trim-btn";
+      startMinus.textContent = "−";
+      startMinus.setAttribute("aria-label", "פחות חיתוך מההתחלה, " + name.textContent);
+      const startPlus = document.createElement("button");
+      startPlus.type = "button";
+      startPlus.className = "btn btn--outline btn--icon layer-card__trim-btn";
+      startPlus.textContent = "+";
+      startPlus.setAttribute("aria-label", "עוד חיתוך מההתחלה, " + name.textContent);
+      startMinus.addEventListener("click", () => {
+        layer.activeFrom = Math.max(0, Math.round(((layer.activeFrom || 0) - TRIM_STEP) * 10) / 10);
+        refreshTrimValues();
+        reanchorLive();
+      });
+      startPlus.addEventListener("click", () => {
+        const maxFrom = Math.max(0, currentTo() - TRIM_STEP);
+        layer.activeFrom = Math.min(maxFrom, Math.round(((layer.activeFrom || 0) + TRIM_STEP) * 10) / 10);
+        refreshTrimValues();
+        reanchorLive();
+      });
+      startGroup.append(startLabel, startMinus, startValue, startPlus);
+
+      const endGroup = document.createElement("div");
+      endGroup.className = "layer-card__trim-group";
+      const endLabel = document.createElement("span");
+      endLabel.className = "layer-card__trim-label";
+      endLabel.textContent = "חיתוך מהסוף";
+      const endMinus = document.createElement("button");
+      endMinus.type = "button";
+      endMinus.className = "btn btn--outline btn--icon layer-card__trim-btn";
+      endMinus.textContent = "−";
+      endMinus.setAttribute("aria-label", "פחות חיתוך מהסוף, " + name.textContent);
+      const endPlus = document.createElement("button");
+      endPlus.type = "button";
+      endPlus.className = "btn btn--outline btn--icon layer-card__trim-btn";
+      endPlus.textContent = "+";
+      endPlus.setAttribute("aria-label", "עוד חיתוך מהסוף, " + name.textContent);
+      endMinus.addEventListener("click", () => {
+        const next = Math.min(loopLength, Math.round((currentTo() + TRIM_STEP) * 10) / 10);
+        layer.activeTo = next;
+        refreshTrimValues();
+        reanchorLive();
+      });
+      endPlus.addEventListener("click", () => {
+        const minTo = Math.min(loopLength, (layer.activeFrom || 0) + TRIM_STEP);
+        layer.activeTo = Math.max(minTo, Math.round((currentTo() - TRIM_STEP) * 10) / 10);
+        refreshTrimValues();
+        reanchorLive();
+      });
+      endGroup.append(endLabel, endMinus, endValue, endPlus);
+      trimRow.append(startGroup, endGroup);
+
+      /* per-layer join round: which repeat this layer starts being heard on, editable after
+         the fact instead of only being fixed at the moment it was recorded, per direct request. */
+      const joinGroup = document.createElement("div");
+      joinGroup.className = "layer-card__trim-group";
+      const joinLabel = document.createElement("span");
+      joinLabel.className = "layer-card__trim-label";
+      joinLabel.textContent = "מצטרף בסיבוב";
+      const joinMinus = document.createElement("button");
+      joinMinus.type = "button";
+      joinMinus.className = "btn btn--outline btn--icon layer-card__trim-btn";
+      joinMinus.textContent = "−";
+      joinMinus.setAttribute("aria-label", "הצטרף מוקדם יותר, " + name.textContent);
+      const joinValue = document.createElement("span");
+      joinValue.className = "layer-card__trim-value";
+      const joinPlus = document.createElement("button");
+      joinPlus.type = "button";
+      joinPlus.className = "btn btn--outline btn--icon layer-card__trim-btn";
+      joinPlus.textContent = "+";
+      joinPlus.setAttribute("aria-label", "הצטרף מאוחר יותר, " + name.textContent);
+      function refreshJoinValue() {
+        joinValue.textContent = String(layer.joinIteration || 0);
+      }
+      refreshJoinValue();
+      joinMinus.addEventListener("click", () => {
+        layer.joinIteration = Math.max(0, (layer.joinIteration || 0) - 1);
+        refreshJoinValue();
+        reanchorLive();
+      });
+      joinPlus.addEventListener("click", () => {
+        layer.joinIteration = Math.min(32, (layer.joinIteration || 0) + 1);
+        refreshJoinValue();
+        reanchorLive();
+      });
+      joinGroup.append(joinLabel, joinMinus, joinValue, joinPlus);
+      trimRow.append(joinGroup);
+
+      card.append(topRow, trimRow);
       layersPanel.appendChild(card);
     });
   }
@@ -755,11 +888,9 @@ function initStudio() {
        preserves the real join order for later. */
     layers = loopData.layers.map((l) => ({ ...l, notes: l.notes.map((n) => ({ ...n })) }));
     loopLength = loopData.loopLength;
-    loopStartTime = ensureAudio().currentTime + 0.05;
-    const maxJoin = layers.reduce((m, l) => Math.max(m, l.joinIteration || 0), 0);
-    scheduledUpToIteration = maxJoin - 1;
+    loopStartTime = ensureAudio().currentTime; /* placeholder so reanchorLive's null-guard passes; it overwrites this */
+    reanchorLive();
     renderLayers();
-    startScheduler();
     updateLoopTrimDisplay();
     previewPanelEl.hidden = false;
     lockRing.style.opacity = "1";
@@ -1271,7 +1402,10 @@ function initMyLoops() {
           /* replays layers joining in the same real order/timing they were added during
              recording, per direct request, not all layers flat from the first note. */
           if (iteration < (layer.joinIteration || 0)) continue;
+          const from = layer.activeFrom || 0;
+          const to = layer.activeTo == null ? loopLength : Math.min(layer.activeTo, loopLength);
           for (const note of layer.notes) {
+            if (note.time < from || note.time > to) continue;
             const nodes = triggerSound(layer.instrument, note.tileIndex, iterStart + note.time, layer.gain);
             playTracker.track(layer, nodes);
           }
