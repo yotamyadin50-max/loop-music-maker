@@ -158,15 +158,33 @@ function decodeLoop(str) {
   try {
     const b64 = str.replace(/-/g, "+").replace(/_/g, "/");
     const json = decodeURIComponent(escape(atob(b64)));
-    return JSON.parse(json);
+    return migrateLoopLayers(JSON.parse(json));
   } catch (e) {
     return null;
   }
 }
 
+/* every layer used to share one global length/joinIteration; each layer now carries its own
+   independent length + an absolute joinAt (seconds from loopStartTime), so a later sound can
+   run longer or shorter than the first one, per direct request. Old saved/shared data only has
+   the shared loopLength and an integer joinIteration, so backfill the new fields from those. */
+function migrateLoopLayers(loopData) {
+  if (!loopData || !Array.isArray(loopData.layers)) return loopData;
+  const masterLength = loopData.loopLength;
+  loopData.layers.forEach((layer) => {
+    if (layer.length == null) layer.length = masterLength;
+    if (layer.joinAt == null) layer.joinAt = (layer.joinIteration || 0) * masterLength;
+    if (layer.activeFrom == null) layer.activeFrom = 0;
+    if (layer.activeTo == null) layer.activeTo = layer.length;
+  });
+  return loopData;
+}
+
 function loadAllLoops() {
   try {
-    return JSON.parse(localStorage.getItem(LS_LOOPS_KEY) || "[]");
+    const list = JSON.parse(localStorage.getItem(LS_LOOPS_KEY) || "[]");
+    list.forEach((entry) => migrateLoopLayers(entry.loop));
+    return list;
   } catch (e) {
     return [];
   }
@@ -268,22 +286,23 @@ function initStudio() {
   let armedAt = 0;
   let loopStartTime = null;
   let loopLength = null;
-  let scheduledUpToIteration = -1;
   let schedulerTimer = null;
   let playheadTimer = null;
-  let layers = []; // { instrument, notes:[{tileIndex,time}], muted, gain }
+  let layers = []; // { instrument, notes:[{tileIndex,time}], muted, gain, length, joinAt, activeFrom, activeTo }
   let pendingTaps = []; // for the layer currently being recorded
   let editingLoopId = null;
   const nodeTracker = createNodeTracker(); // keyed by layer object, so mute/delete/restart can silence what's already scheduled
 
-  /* preview mode: a second, separate playback engine (own tracker, own timer, own iteration
-     count) so it can pause/resume/restart without touching the live-recording clock or state,
-     per direct request for the same build-up preview + pause/resume/restart already in
-     "הלופים שלי" to also work live, inside the Studio, while still editing. */
+  /* preview mode: a second, separate playback engine (own tracker, own timer, own elapsed clock)
+     so it can pause/resume/restart without touching the live-recording clock or state, per
+     direct request for the same build-up preview + pause/resume/restart already in "הלופים שלי"
+     to also work live, inside the Studio, while still editing. A look-ahead scheduler, same
+     shape as the live one below, since each layer can now have its own independent length. */
   let previewMode = false;
   let previewPlaying = false;
-  let previewToken = 0;
-  let previewResumeIteration = 0;
+  let previewTimer = null;
+  let previewAnchor = 0; // ctx time representing elapsed=0 on the preview timeline
+  let previewResumeElapsed = 0;
   const previewTracker = createNodeTracker();
 
   /* build 32 pads */
@@ -340,14 +359,12 @@ function initStudio() {
       could bake in taps the player never meant to record. Found from a real report: "I want to
       still be able to play sounds without starting a loop." */
 
-    if (loopStartTime === null) {
-      /* recording the very first layer, freeform, no loop clock yet */
-      pendingTaps.push({ tileIndex: index, absTime: now });
-    } else {
-      /* a loop is already running and a new layer is armed; record this tap loop-relative */
-      const relTime = (now - loopStartTime) % loopLength;
-      pendingTaps.push({ tileIndex: index, time: relTime });
-    }
+    /* record raw elapsed time since THIS recording's own "התחל" press, same for the first
+       layer or any later one: no longer force-wrapped into an existing loop's length, so a
+       later sound's own pattern can run longer (or shorter) than the first one, per direct
+       request. The wrap used to fold long taps back on themselves mid-recording, scrambling
+       the pattern the player actually meant to make. */
+    pendingTaps.push({ tileIndex: index, absTime: now });
     enterLoopBtn.disabled = pendingTaps.length === 0;
     updateInstrumentLock();
   }
@@ -370,43 +387,57 @@ function initStudio() {
     if (pendingTaps.length === 0) return;
     const ctx = ensureAudio();
 
+    /* closing gap = opening gap, per the approved rule: every layer gets its OWN length this
+       way, not just the first one, so a later sound can run longer or shorter than the first,
+       per direct request ("I want to be able to make the second sound longer than the first
+       sound's loop"). Floor at 0.3s: a real human can't close a loop faster than that, and a
+       near-zero length would make its scheduler re-enter itself absurdly fast. */
+    const first = pendingTaps[0];
+    const last = pendingTaps[pendingTaps.length - 1];
+    const gap0 = first.absTime - armedAt;
+    const layerLength = Math.max(0.3, last.absTime - armedAt + gap0);
+    const notes = pendingTaps.map((t) => ({ tileIndex: t.tileIndex, time: t.absTime - armedAt }));
+
     if (loopStartTime === null) {
-      /* closing the FIRST loop: closing gap = opening gap, per the approved rule */
-      const first = pendingTaps[0];
-      const last = pendingTaps[pendingTaps.length - 1];
-      const gap0 = first.absTime - armedAt;
+      /* the first layer also defines the master grid: the clock everyone else's join timing,
+         the playhead, and the round indicator are measured against. */
       loopStartTime = armedAt;
-      /* floor at 0.3s: a real human can't close a loop faster than that, and every recursive
-         preview/playback scheduler below times its own delay off loopLength, so a near-zero
-         value would spin them in a runaway near-0ms setTimeout loop and freeze the tab. */
-      loopLength = Math.max(0.3, last.absTime - armedAt + gap0);
-      layers.push({
+      loopLength = layerLength;
+      const layer = {
         instrument: currentInstrument,
-        notes: pendingTaps.map((t) => ({ tileIndex: t.tileIndex, time: t.absTime - armedAt })),
+        notes,
         muted: false,
         gain: 1,
-        joinIteration: 0, /* already playing live from the start, no wait */
+        length: layerLength,
+        joinAt: 0,
         activeFrom: 0,
-        activeTo: loopLength,
-      });
-      scheduledUpToIteration = 0; /* iteration 0 already played live */
+        activeTo: layerLength,
+      };
+      layer._nextCycleStart = loopStartTime + loopLength; /* cycle 0 already played live while tapping */
+      layers.push(layer);
       startScheduler();
       updateLoopTrimDisplay();
       previewPanelEl.hidden = false;
     } else {
-      /* an added layer joins exactly 1 full round from now: the round in progress
-         finishes as-is, the new layer plays starting the next full repeat. Chosen
-         over an unpredictable "whenever the scheduler happens to catch up" join,
-         per direct request to pick a consistent rule rather than leave it implicit. */
-      layers.push({
+      /* an added layer joins at the next full round of the MASTER grid: the round in progress
+         finishes as-is, the new layer starts at the next clean boundary. Chosen over an
+         unpredictable "whenever the scheduler happens to catch up" join, per direct request to
+         pick a consistent rule rather than leave it implicit. From there on it repeats at ITS
+         OWN length, independent of the master grid or any other layer's length. */
+      const elapsed = ctx.currentTime - loopStartTime;
+      const joinAt = (Math.floor(elapsed / loopLength) + 1) * loopLength;
+      const layer = {
         instrument: currentInstrument,
-        notes: pendingTaps.map((t) => ({ tileIndex: t.tileIndex, time: t.time })),
+        notes,
         muted: false,
         gain: 1,
-        joinIteration: scheduledUpToIteration + 1,
+        length: layerLength,
+        joinAt,
         activeFrom: 0,
-        activeTo: loopLength,
-      });
+        activeTo: layerLength,
+      };
+      layer._nextCycleStart = loopStartTime + joinAt;
+      layers.push(layer);
     }
     pendingTaps = [];
     enterLoopBtn.disabled = true;
@@ -427,12 +458,13 @@ function initStudio() {
   }
 
   function latestNoteEnd() {
-    /* the real floor for trimming: never cut the loop shorter than its own last note, per
-       direct request to edit the length "like trimming the clip", not silently drop content. */
+    /* the real floor for trimming the MASTER grid (the global loop-length control): never cut
+       it shorter than the first layer's own last note, per direct request to edit the length
+       "like trimming the clip", not silently drop content. Other layers now keep their own
+       independent length, unaffected by this control, so only layer 0 counts here. */
+    if (layers.length === 0) return 0;
     let latest = 0;
-    for (const layer of layers) {
-      for (const note of layer.notes) latest = Math.max(latest, note.time);
-    }
+    for (const note of layers[0].notes) latest = Math.max(latest, note.time);
     return latest;
   }
 
@@ -505,11 +537,12 @@ function initStudio() {
   });
 
   function reanchorLive() {
-    /* re-anchor the clock without discarding each layer's real joinIteration (still the source
-       of truth for the build-up order once saved), so everyone already-present plays together
-       immediately while actively editing. The next iteration to schedule is maxJoin (the last
-       layer's join round), so loopStartTime must sit maxJoin*loopLength in the PAST for that
-       iteration's start time to land on "now" instead of maxJoin loops in the future. */
+    /* re-anchor the clock without discarding each layer's real joinAt (still the source of
+       truth for the build-up order once saved), so everyone already-present plays together
+       immediately while actively editing, regardless of their own length or when they'd
+       normally join. loopStartTime resets to "now" too (not just layer 0's own next cycle),
+       which keeps the playhead/round-indicator honest about what's actually audible, since
+       layer 0 (the master grid) also restarts its cycle right here. */
     if (loopStartTime === null) return;
     if (previewMode) {
       /* any live edit (trim, join round, loop length) drops back to normal editing, same rule
@@ -520,9 +553,9 @@ function initStudio() {
     }
     stopScheduler();
     nodeTracker.stopAll();
-    const maxJoin = layers.reduce((m, l) => Math.max(m, l.joinIteration || 0), 0);
-    scheduledUpToIteration = maxJoin - 1;
-    loopStartTime = ensureAudio().currentTime + 0.05 - maxJoin * loopLength;
+    const now = ensureAudio().currentTime + 0.05;
+    loopStartTime = now;
+    layers.forEach((layer) => { layer._nextCycleStart = now; });
     startScheduler();
   }
 
@@ -530,8 +563,14 @@ function initStudio() {
     if (newLength === null || Number.isNaN(newLength)) return;
     const floor = latestNoteEnd() + 0.05;
     loopLength = Math.max(floor, Math.round(newLength * 10) / 10);
+    if (layers[0]) {
+      layers[0].length = loopLength; /* layer 0 IS the master grid, keep them equal */
+      if (layers[0].activeTo > loopLength) layers[0].activeTo = loopLength;
+      if ((layers[0].activeFrom || 0) > loopLength) layers[0].activeFrom = loopLength;
+    }
     reanchorLive();
     updateLoopTrimDisplay();
+    renderLayers(); /* layer 0's own trim/length readout depends on loopLength too, keep it in sync */
   }
   trimShorterBtn.addEventListener("click", () => {
     if (loopLength === null) return;
@@ -544,41 +583,56 @@ function initStudio() {
 
   function stopPreviewPlayback() {
     previewPlaying = false;
-    previewToken++;
+    if (previewTimer) clearInterval(previewTimer);
+    previewTimer = null;
     previewTracker.stopAll();
     previewPlayBtn.textContent = "▶";
     previewPlayBtn.setAttribute("aria-label", "נגן מההתחלה");
   }
 
-  function startPreviewPlayback(fromIteration) {
+  /* look-ahead scheduler, same shape as the live one below: each layer can have its own
+     independent length now, so a single shared "iteration" number no longer describes
+     playback position. fromElapsed is seconds into the preview timeline (0 = the very start,
+     or wherever a previous pause left off), used to resume in place. */
+  function startPreviewPlayback(fromElapsed) {
     const ctx = ensureAudio();
     previewPlaying = true;
     previewPlayBtn.textContent = "⏸";
     previewPlayBtn.setAttribute("aria-label", "השהה תצוגה מקדימה");
-    const myToken = ++previewToken;
-    let iteration = fromIteration;
-    const startAt = ctx.currentTime + 0.05;
-    function scheduleIteration() {
-      if (myToken !== previewToken) return;
-      previewResumeIteration = iteration;
-      const iterStart = startAt + (iteration - fromIteration) * loopLength;
-      for (const layer of layers) {
-        if (layer.muted) continue;
-        if (iteration < (layer.joinIteration || 0)) continue; /* the real build-up order */
-        const from = layer.activeFrom || 0;
-        const to = layer.activeTo == null ? loopLength : Math.min(layer.activeTo, loopLength);
+    previewAnchor = ctx.currentTime + 0.05 - fromElapsed;
+    layers.forEach((layer) => {
+      const period = layer.length || loopLength;
+      const joinAt = layer.joinAt || 0;
+      const startElapsed = Math.max(joinAt, fromElapsed);
+      const n = Math.ceil((startElapsed - joinAt) / period);
+      layer._previewNextCycleStart = previewAnchor + joinAt + n * period;
+    });
+    if (previewTimer) clearInterval(previewTimer);
+    previewTimer = setInterval(previewTick, 25);
+  }
+
+  function previewTick() {
+    const ctx = ensureAudio();
+    const scheduleAhead = 0.15;
+    previewResumeElapsed = ctx.currentTime - previewAnchor;
+    for (const layer of layers) {
+      if (layer.muted) continue;
+      const period = layer.length || loopLength;
+      const from = layer.activeFrom || 0;
+      const to = layer.activeTo == null ? period : Math.min(layer.activeTo, period);
+      while (layer._previewNextCycleStart < ctx.currentTime + scheduleAhead) {
+        const cycleStart = layer._previewNextCycleStart;
         for (const note of layer.notes) {
           if (note.time < from || note.time > to) continue;
-          const nodes = triggerSound(layer.instrument, note.tileIndex, iterStart + note.time, layer.gain);
+          const when = cycleStart + note.time;
+          const nodes = triggerSound(layer.instrument, note.tileIndex, when, layer.gain);
           previewTracker.track(layer, nodes);
-          const delayMs = Math.max(0, iterStart + note.time - ctx.currentTime) * 1000;
+          const delayMs = Math.max(0, (when - ctx.currentTime) * 1000);
           setTimeout(() => lightPad(note.tileIndex, layer.instrument), delayMs);
         }
+        layer._previewNextCycleStart += period;
       }
-      iteration++;
-      setTimeout(scheduleIteration, Math.max(50, loopLength * 1000 - 30)); /* floor: never re-enter faster than 50ms, however small loopLength is */
     }
-    scheduleIteration();
   }
 
   function enterPreview() {
@@ -587,7 +641,7 @@ function initStudio() {
     stopScheduler(); /* pause live editing playback so the two engines never overlap */
     nodeTracker.stopAll();
     previewHintEl.hidden = false;
-    previewResumeIteration = 0;
+    previewResumeElapsed = 0;
     startPreviewPlayback(0);
   }
   function exitPreview() {
@@ -604,7 +658,7 @@ function initStudio() {
       return;
     }
     if (previewPlaying) stopPreviewPlayback();
-    else startPreviewPlayback(previewResumeIteration);
+    else startPreviewPlayback(previewResumeElapsed);
   });
   previewRestartBtn.addEventListener("click", () => {
     if (!previewMode) enterPreview();
@@ -635,8 +689,8 @@ function initStudio() {
       const elapsed = ctx.currentTime - loopStartTime;
       const progress = (elapsed % loopLength) / loopLength;
       playheadFill.style.width = Math.max(0, Math.min(1, progress)) * 100 + "%";
-      /* the same iteration count the scheduler itself uses for joinIteration comparisons,
-         surfaced so "מצטרף בסיבוב" on a layer card means something concrete while editing. */
+      /* rounds of the MASTER grid (layer 0's own length), surfaced so "מצטרף בסיבוב" on a
+         layer card means something concrete while editing. */
       currentRoundWrapEl.hidden = false;
       currentRoundEl.textContent = String(Math.max(0, Math.floor(elapsed / loopLength)));
     }, 50);
@@ -647,30 +701,30 @@ function initStudio() {
     playheadFill.style.width = "0%";
     currentRoundWrapEl.hidden = true;
   }
+  /* each layer now repeats at its own independent length, so scheduling tracks each layer's
+     own next-cycle time instead of one shared iteration count across the whole loop. */
   function schedulerTick() {
     if (loopStartTime === null) return;
     const ctx = ensureAudio();
     const scheduleAhead = 0.15;
-    let iterIndex = scheduledUpToIteration + 1;
-    let iterStart = loopStartTime + iterIndex * loopLength;
-    while (iterStart < ctx.currentTime + scheduleAhead) {
-      for (const layer of layers) {
-        if (layer.muted) continue;
-        if (iterIndex < (layer.joinIteration || 0)) continue; /* not joined yet, per the chosen 1-round rule */
-        const from = layer.activeFrom || 0;
-        const to = layer.activeTo == null ? loopLength : Math.min(layer.activeTo, loopLength);
+    for (const layer of layers) {
+      if (layer.muted) continue;
+      if (layer._nextCycleStart === undefined) layer._nextCycleStart = loopStartTime + (layer.joinAt || 0);
+      const period = layer.length || loopLength;
+      const from = layer.activeFrom || 0;
+      const to = layer.activeTo == null ? period : Math.min(layer.activeTo, period);
+      while (layer._nextCycleStart < ctx.currentTime + scheduleAhead) {
+        const cycleStart = layer._nextCycleStart;
         for (const note of layer.notes) {
           if (note.time < from || note.time > to) continue; /* trimmed off this layer's own start/end */
-          const when = iterStart + note.time;
+          const when = cycleStart + note.time;
           const nodes = triggerSound(layer.instrument, note.tileIndex, when, layer.gain);
           nodeTracker.track(layer, nodes);
           const delayMs = Math.max(0, (when - ctx.currentTime) * 1000);
           setTimeout(() => lightPad(note.tileIndex, layer.instrument), delayMs);
         }
+        layer._nextCycleStart += period;
       }
-      scheduledUpToIteration = iterIndex;
-      iterIndex++;
-      iterStart = loopStartTime + iterIndex * loopLength;
     }
   }
 
@@ -730,15 +784,19 @@ function initStudio() {
       topRow.className = "layer-card__top";
       topRow.append(dot, name, volume, muteBtn, delBtn);
 
-      /* per-layer trim: independent start/end cut for THIS sound's own loop window,
-         on top of the shared loop length, per direct request. Shown as "how much cut",
-         matching the user's own words ("remove time from the start and from the end"). */
+      /* per-layer trim: independent start/end cut for THIS sound's own loop window, within
+         its OWN length (every layer now has one, independent of any other layer's), per
+         direct request. Shown as "how much cut", matching the user's own words ("remove time
+         from the start and from the end"). */
       const TRIM_STEP = 0.1;
       const trimRow = document.createElement("div");
       trimRow.className = "layer-card__trim";
 
+      function layerPeriod() {
+        return layer.length || loopLength;
+      }
       function currentTo() {
-        return layer.activeTo == null ? loopLength : layer.activeTo;
+        return layer.activeTo == null ? layerPeriod() : layer.activeTo;
       }
       const startValue = document.createElement("span");
       startValue.className = "layer-card__trim-value";
@@ -748,7 +806,7 @@ function initStudio() {
       lengthValue.className = "layer-card__trim-value layer-card__trim-value--length";
       function refreshTrimValues() {
         startValue.textContent = (layer.activeFrom || 0).toFixed(1) + " שנ'";
-        endValue.textContent = Math.max(0, loopLength - currentTo()).toFixed(1) + " שנ'";
+        endValue.textContent = Math.max(0, layerPeriod() - currentTo()).toFixed(1) + " שנ'";
         lengthValue.textContent = Math.max(0, currentTo() - (layer.activeFrom || 0)).toFixed(1) + " שנ'";
       }
       refreshTrimValues();
@@ -808,13 +866,13 @@ function initStudio() {
       endPlus.textContent = "+";
       endPlus.setAttribute("aria-label", "עוד חיתוך מהסוף, " + name.textContent);
       endMinus.addEventListener("click", () => {
-        const next = Math.min(loopLength, Math.round((currentTo() + TRIM_STEP) * 10) / 10);
+        const next = Math.min(layerPeriod(), Math.round((currentTo() + TRIM_STEP) * 10) / 10);
         layer.activeTo = next;
         refreshTrimValues();
         reanchorLive();
       });
       endPlus.addEventListener("click", () => {
-        const minTo = Math.min(loopLength, (layer.activeFrom || 0) + TRIM_STEP);
+        const minTo = Math.min(layerPeriod(), (layer.activeFrom || 0) + TRIM_STEP);
         layer.activeTo = Math.max(minTo, Math.round((currentTo() - TRIM_STEP) * 10) / 10);
         refreshTrimValues();
         reanchorLive();
@@ -822,8 +880,11 @@ function initStudio() {
       endGroup.append(endLabel, endMinus, endValue, endPlus);
       trimRow.append(startGroup, endGroup);
 
-      /* per-layer join round: which repeat this layer starts being heard on, editable after
-         the fact instead of only being fixed at the moment it was recorded, per direct request. */
+      /* per-layer join round: which repeat of the MASTER grid this layer starts being heard
+         on, editable after the fact instead of only being fixed at the moment it was recorded,
+         per direct request. Stored as joinAt (seconds from loopStartTime) so it can outlive a
+         layer's own independent length, but shown/edited as whole master-grid rounds, same
+         UX as before. */
       const joinGroup = document.createElement("div");
       joinGroup.className = "layer-card__trim-group";
       const joinLabel = document.createElement("span");
@@ -842,16 +903,16 @@ function initStudio() {
       joinPlus.textContent = "+";
       joinPlus.setAttribute("aria-label", "הצטרף מאוחר יותר, " + name.textContent);
       function refreshJoinValue() {
-        joinValue.textContent = String(layer.joinIteration || 0);
+        joinValue.textContent = String(Math.round((layer.joinAt || 0) / loopLength));
       }
       refreshJoinValue();
       joinMinus.addEventListener("click", () => {
-        layer.joinIteration = Math.max(0, (layer.joinIteration || 0) - 1);
+        layer.joinAt = Math.max(0, Math.round(((layer.joinAt || 0) - loopLength) * 100) / 100);
         refreshJoinValue();
         reanchorLive();
       });
       joinPlus.addEventListener("click", () => {
-        layer.joinIteration = Math.min(32, (layer.joinIteration || 0) + 1);
+        layer.joinAt = Math.min(32 * loopLength, (layer.joinAt || 0) + loopLength);
         refreshJoinValue();
         reanchorLive();
       });
@@ -876,7 +937,6 @@ function initStudio() {
     armed = false;
     loopStartTime = null;
     loopLength = null;
-    scheduledUpToIteration = -1;
     layers = [];
     pendingTaps = [];
     editingLoopId = null;
@@ -893,7 +953,9 @@ function initStudio() {
 
   saveBtn.addEventListener("click", () => {
     if (layers.length === 0) return;
-    const loopData = { loopLength, layers };
+    /* strip transient runtime scheduling state (_nextCycleStart is a raw AudioContext
+       timestamp, meaningless once reloaded) before persisting */
+    const loopData = { loopLength, layers: layers.map(({ _nextCycleStart, ...l }) => l) };
     const all = loadAllLoops();
     if (editingLoopId) {
       const idx = all.findIndex((l) => l.id === editingLoopId);
@@ -913,11 +975,11 @@ function initStudio() {
   function loadLoopIntoStudio(loopData) {
     stopScheduler();
     nodeTracker.stopAll();
-    /* keep each layer's real original joinIteration (when it actually joined during recording),
-       not reset to 0: that's the exact data "הלופים שלי" now replays as the build-up order, and
+    /* keep each layer's real original joinAt (when it actually joined during recording), not
+       reset to 0: that's the exact data "הלופים שלי" now replays as the build-up order, and
        editing/re-saving here must not silently erase it. The editor itself still hears everyone
-       together immediately (see the scheduledUpToIteration line below), only the SAVED data
-       preserves the real join order for later. */
+       together immediately (reanchorLive below), only the SAVED data preserves the real join
+       order and each layer's own independent length for later. */
     layers = loopData.layers.map((l) => ({ ...l, notes: l.notes.map((n) => ({ ...n })) }));
     loopLength = loopData.loopLength;
     loopStartTime = ensureAudio().currentTime; /* placeholder so reanchorLive's null-guard passes; it overwrites this */
@@ -1395,8 +1457,9 @@ function initMyLoops() {
     actions.className = "loop-card__actions";
 
     let playing = false;
-    let playToken = 0;
-    let resumeIteration = 0; /* where a future "play" press continues from, not always 0 */
+    let playTimer = null;
+    let playAnchor = 0; // ctx time representing elapsed=0 on this card's playback timeline
+    let resumeElapsed = 0; /* where a future "play" press continues from, not always 0 */
     const playTracker = createNodeTracker();
     const playBtn = document.createElement("button");
     playBtn.className = "btn btn--outline btn--icon";
@@ -1410,42 +1473,52 @@ function initMyLoops() {
 
     function stopPlayback() {
       playing = false;
-      playToken++;
+      if (playTimer) clearInterval(playTimer);
+      playTimer = null;
       playTracker.stopAll(); /* stop silences what's already scheduled, not just future notes */
       playBtn.textContent = "▶";
     }
 
-    /* fromIteration lets "play" mean two different things on purpose: resuming (continue from
-       resumeIteration) or restarting (always 0), per direct request for both, not just one. */
-    function startPlayback(fromIteration) {
+    /* look-ahead scheduler, same shape as Studio's: each layer has its own independent length,
+       so a single shared "iteration" number can't describe playback position across all of
+       them. fromElapsed lets "play" mean two different things on purpose: resuming (continue
+       from resumeElapsed) or restarting (always 0), per direct request for both, not just one. */
+    function startPlayback(fromElapsed) {
       const ctx = ensureAudio();
       playing = true;
       playBtn.textContent = "⏸";
-      const myToken = ++playToken;
       const { loopLength, layers } = entry.loop;
-      let iteration = fromIteration;
-      const startAt = ctx.currentTime + 0.05;
-      function scheduleIteration() {
-        if (myToken !== playToken) return;
-        resumeIteration = iteration;
-        const iterStart = startAt + (iteration - fromIteration) * loopLength;
+      playAnchor = ctx.currentTime + 0.05 - fromElapsed;
+      layers.forEach((layer) => {
+        const period = layer.length || loopLength;
+        const joinAt = layer.joinAt || 0;
+        const startElapsed = Math.max(joinAt, fromElapsed);
+        const n = Math.ceil((startElapsed - joinAt) / period);
+        layer._myNextCycleStart = playAnchor + joinAt + n * period;
+      });
+      if (playTimer) clearInterval(playTimer);
+      playTimer = setInterval(() => {
+        const c = ensureAudio();
+        const scheduleAhead = 0.15;
+        resumeElapsed = c.currentTime - playAnchor;
         for (const layer of layers) {
           if (layer.muted) continue;
           /* replays layers joining in the same real order/timing they were added during
              recording, per direct request, not all layers flat from the first note. */
-          if (iteration < (layer.joinIteration || 0)) continue;
+          const period = layer.length || loopLength;
           const from = layer.activeFrom || 0;
-          const to = layer.activeTo == null ? loopLength : Math.min(layer.activeTo, loopLength);
-          for (const note of layer.notes) {
-            if (note.time < from || note.time > to) continue;
-            const nodes = triggerSound(layer.instrument, note.tileIndex, iterStart + note.time, layer.gain);
-            playTracker.track(layer, nodes);
+          const to = layer.activeTo == null ? period : Math.min(layer.activeTo, period);
+          while (layer._myNextCycleStart < c.currentTime + scheduleAhead) {
+            const cycleStart = layer._myNextCycleStart;
+            for (const note of layer.notes) {
+              if (note.time < from || note.time > to) continue;
+              const nodes = triggerSound(layer.instrument, note.tileIndex, cycleStart + note.time, layer.gain);
+              playTracker.track(layer, nodes);
+            }
+            layer._myNextCycleStart += period;
           }
         }
-        iteration++;
-        setTimeout(scheduleIteration, Math.max(50, loopLength * 1000 - 30)); /* floor: never re-enter faster than 50ms, however small loopLength is */
-      }
-      scheduleIteration();
+      }, 25);
     }
 
     playBtn.addEventListener("click", () => {
@@ -1453,11 +1526,11 @@ function initMyLoops() {
         stopPlayback();
         return;
       }
-      startPlayback(resumeIteration);
+      startPlayback(resumeElapsed);
     });
     restartBtn.addEventListener("click", () => {
       stopPlayback();
-      resumeIteration = 0;
+      resumeElapsed = 0;
       startPlayback(0);
     });
 
