@@ -772,7 +772,7 @@ function initStudio() {
     layers.forEach((layer, i) => {
       perInstrumentCount[layer.instrument]++;
       const card = document.createElement("div");
-      card.className = "layer-card";
+      card.className = "layer-card" + (layer.muted ? " layer-card--muted" : "");
       const dot = document.createElement("span");
       dot.className = "layer-card__dot layer-card__dot--" + layer.instrument;
       const name = document.createElement("span");
@@ -797,7 +797,25 @@ function initStudio() {
       muteBtn.textContent = layer.muted ? "🔇" : "🔊";
       muteBtn.addEventListener("click", () => {
         layer.muted = !layer.muted;
-        if (layer.muted) nodeTracker.stop(layer); /* silence what's already scheduled, not just future notes */
+        if (layer.muted) {
+          nodeTracker.stop(layer); /* silence what's already scheduled, not just future notes */
+          previewTracker.stop(layer);
+        } else {
+          /* while muted, neither scheduler advanced this layer's own next-cycle clock, so
+             un-muting after a while would otherwise replay every missed cycle at once in a
+             single tick (Web Audio clamps a `when` in the past to "now"): a burst instead of
+             silence. Fast-forward each engine's pointer to the next real upcoming boundary. */
+          const ctx = ensureAudio();
+          const period = effectivePeriod(layer);
+          if (layer._nextCycleStart !== undefined) {
+            const elapsed = ctx.currentTime - layer._nextCycleStart;
+            if (elapsed > 0) layer._nextCycleStart += Math.ceil(elapsed / period) * period;
+          }
+          if (layer._previewNextCycleStart !== undefined) {
+            const elapsedP = ctx.currentTime - layer._previewNextCycleStart;
+            if (elapsedP > 0) layer._previewNextCycleStart += Math.ceil(elapsedP / period) * period;
+          }
+        }
         renderLayers();
       });
       const delBtn = document.createElement("button");
@@ -807,6 +825,7 @@ function initStudio() {
       delBtn.textContent = "🗑";
       delBtn.addEventListener("click", () => {
         nodeTracker.stop(layer); /* real delete stops sound immediately, not just after the current pass finishes */
+        previewTracker.stop(layer); /* same, for whichever engine (live or preview) happens to be running */
         layers.splice(i, 1);
         renderLayers();
       });
