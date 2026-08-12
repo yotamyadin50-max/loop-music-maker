@@ -251,7 +251,15 @@ function initStudio() {
   const loopLengthDisplayEl = root.querySelector("[data-loop-length-display]");
   const trimShorterBtn = root.querySelector("[data-action='trim-shorter']");
   const trimLongerBtn = root.querySelector("[data-action='trim-longer']");
+  const trimTrackEl = root.querySelector("[data-loop-trim-track]");
+  const trimFillEl = root.querySelector("[data-loop-trim-fill]");
+  const trimHandleEl = root.querySelector("[data-loop-trim-handle]");
   const LOOP_TRIM_STEP = 0.1;
+  let trimMax = 4; /* the draggable track's own scale in seconds, recomputed whenever a loop is (re)established */
+  const previewPanelEl = root.querySelector("[data-preview-panel]");
+  const previewPlayBtn = root.querySelector("[data-action='preview-play']");
+  const previewRestartBtn = root.querySelector("[data-action='preview-restart']");
+  const previewHintEl = root.querySelector("[data-preview-hint]");
 
   let currentInstrument = "drums";
   let armed = false;
@@ -265,6 +273,16 @@ function initStudio() {
   let pendingTaps = []; // for the layer currently being recorded
   let editingLoopId = null;
   const nodeTracker = createNodeTracker(); // keyed by layer object, so mute/delete/restart can silence what's already scheduled
+
+  /* preview mode: a second, separate playback engine (own tracker, own timer, own iteration
+     count) so it can pause/resume/restart without touching the live-recording clock or state,
+     per direct request for the same build-up preview + pause/resume/restart already in
+     "הלופים שלי" to also work live, inside the Studio, while still editing. */
+  let previewMode = false;
+  let previewPlaying = false;
+  let previewToken = 0;
+  let previewResumeIteration = 0;
+  const previewTracker = createNodeTracker();
 
   /* build 32 pads */
   const pads = [];
@@ -334,6 +352,7 @@ function initStudio() {
   pads.forEach((pad) => pad.addEventListener("pointerdown", () => padTap(Number(pad.dataset.index))));
 
   startBtn.addEventListener("click", () => {
+    exitPreview(); /* "התחל" always means "back to editing", per direct instruction */
     const ctx = ensureAudio();
     armed = true;
     armedAt = ctx.currentTime;
@@ -366,6 +385,7 @@ function initStudio() {
       scheduledUpToIteration = 0; /* iteration 0 already played live */
       startScheduler();
       updateLoopTrimDisplay();
+      previewPanelEl.hidden = false;
     } else {
       /* an added layer joins exactly 1 full round from now: the round in progress
          finishes as-is, the new layer plays starting the next full repeat. Chosen
@@ -414,9 +434,69 @@ function initStudio() {
     }
     loopTrimEl.hidden = false;
     loopLengthDisplayEl.textContent = loopLength.toFixed(1) + " שנ'";
+    /* keep the drag track's own scale stable and always wide enough to reach the current
+       length, so a big loop is never stuck squeezed against the handle's max position. */
+    if (loopLength > trimMax * 0.9) trimMax = Math.max(loopLength * 1.6, latestNoteEnd() + 3);
+    const pct = Math.max(0, Math.min(100, (loopLength / trimMax) * 100));
+    trimFillEl.style.width = pct + "%";
+    trimHandleEl.style.insetInlineStart = pct + "%";
+    trimHandleEl.setAttribute("aria-valuenow", loopLength.toFixed(1));
+    trimHandleEl.setAttribute("aria-valuemax", trimMax.toFixed(1));
   }
 
+  function trackPositionToLength(clientX) {
+    const rect = trimTrackEl.getBoundingClientRect();
+    if (!rect.width) return null; /* not actually laid out yet, don't compute a bogus value */
+    /* the track reads right-to-left in this RTL layout: the start (0s) edge is the visual right */
+    const fromRight = rect.right - clientX;
+    const frac = Math.max(0, Math.min(1, fromRight / rect.width));
+    return frac * trimMax;
+  }
+
+  let trimDragging = false;
+  trimHandleEl.addEventListener("pointerdown", (e) => {
+    if (loopLength === null) return;
+    trimDragging = true;
+    trimHandleEl.setPointerCapture(e.pointerId);
+  });
+  trimHandleEl.addEventListener("pointermove", (e) => {
+    if (!trimDragging) return;
+    const preview = trackPositionToLength(e.clientX);
+    if (preview === null) return;
+    const pct = Math.max(0, Math.min(100, (preview / trimMax) * 100));
+    trimFillEl.style.width = pct + "%";
+    trimHandleEl.style.insetInlineStart = pct + "%";
+    loopLengthDisplayEl.textContent = Math.max(latestNoteEnd() + 0.05, preview).toFixed(1) + " שנ'";
+  });
+  function finishTrimDrag(e) {
+    if (!trimDragging) return;
+    trimDragging = false;
+    const value = trackPositionToLength(e.clientX);
+    if (value === null) {
+      updateLoopTrimDisplay(); /* snap back to the real value instead of leaving a stale preview */
+      return;
+    }
+    applyLoopLength(value);
+  }
+  trimHandleEl.addEventListener("pointerup", finishTrimDrag);
+  trimHandleEl.addEventListener("pointercancel", () => {
+    trimDragging = false;
+    updateLoopTrimDisplay();
+  });
+  trimHandleEl.addEventListener("keydown", (e) => {
+    if (loopLength === null) return;
+    if (e.key === "ArrowLeft") applyLoopLength(loopLength - LOOP_TRIM_STEP);
+    else if (e.key === "ArrowRight") applyLoopLength(loopLength + LOOP_TRIM_STEP);
+  });
+  /* clicking anywhere on the track jumps the handle straight there, a real "cut here" gesture */
+  trimTrackEl.addEventListener("pointerdown", (e) => {
+    if (loopLength === null || e.target === trimHandleEl) return;
+    const value = trackPositionToLength(e.clientX);
+    if (value !== null) applyLoopLength(value);
+  });
+
   function applyLoopLength(newLength) {
+    if (newLength === null || Number.isNaN(newLength)) return;
     const floor = latestNoteEnd() + 0.05;
     loopLength = Math.max(floor, Math.round(newLength * 10) / 10);
     stopScheduler();
@@ -437,6 +517,77 @@ function initStudio() {
   trimLongerBtn.addEventListener("click", () => {
     if (loopLength === null) return;
     applyLoopLength(loopLength + LOOP_TRIM_STEP);
+  });
+
+  function stopPreviewPlayback() {
+    previewPlaying = false;
+    previewToken++;
+    previewTracker.stopAll();
+    previewPlayBtn.textContent = "▶";
+    previewPlayBtn.setAttribute("aria-label", "נגן מההתחלה");
+  }
+
+  function startPreviewPlayback(fromIteration) {
+    const ctx = ensureAudio();
+    previewPlaying = true;
+    previewPlayBtn.textContent = "⏸";
+    previewPlayBtn.setAttribute("aria-label", "השהה תצוגה מקדימה");
+    const myToken = ++previewToken;
+    let iteration = fromIteration;
+    const startAt = ctx.currentTime + 0.05;
+    function scheduleIteration() {
+      if (myToken !== previewToken) return;
+      previewResumeIteration = iteration;
+      const iterStart = startAt + (iteration - fromIteration) * loopLength;
+      for (const layer of layers) {
+        if (layer.muted) continue;
+        if (iteration < (layer.joinIteration || 0)) continue; /* the real build-up order */
+        for (const note of layer.notes) {
+          const nodes = triggerSound(layer.instrument, note.tileIndex, iterStart + note.time, layer.gain);
+          previewTracker.track(layer, nodes);
+          const delayMs = Math.max(0, iterStart + note.time - ctx.currentTime) * 1000;
+          setTimeout(() => lightPad(note.tileIndex, layer.instrument), delayMs);
+        }
+      }
+      iteration++;
+      setTimeout(scheduleIteration, loopLength * 1000 - 30);
+    }
+    scheduleIteration();
+  }
+
+  function enterPreview() {
+    if (loopLength === null) return;
+    previewMode = true;
+    stopScheduler(); /* pause live editing playback so the two engines never overlap */
+    nodeTracker.stopAll();
+    previewHintEl.hidden = false;
+    previewResumeIteration = 0;
+    startPreviewPlayback(0);
+  }
+  function exitPreview() {
+    if (!previewMode) return;
+    previewMode = false;
+    stopPreviewPlayback();
+    /* back to normal live editing: everyone already recorded plays together again immediately */
+    const maxJoin = layers.reduce((m, l) => Math.max(m, l.joinIteration || 0), 0);
+    scheduledUpToIteration = maxJoin - 1;
+    startScheduler();
+  }
+
+  previewPlayBtn.addEventListener("click", () => {
+    if (!previewMode) {
+      enterPreview();
+      return;
+    }
+    if (previewPlaying) stopPreviewPlayback();
+    else startPreviewPlayback(previewResumeIteration);
+  });
+  previewRestartBtn.addEventListener("click", () => {
+    if (!previewMode) enterPreview();
+    else {
+      stopPreviewPlayback();
+      startPreviewPlayback(0);
+    }
   });
 
   function startScheduler() {
@@ -551,6 +702,10 @@ function initStudio() {
   restartBtn.addEventListener("click", async () => {
     const ok = await confirmDialog("למחוק הכל ולהתחיל מאפס?");
     if (!ok) return;
+    stopPreviewPlayback();
+    previewMode = false;
+    previewPanelEl.hidden = true;
+    previewHintEl.hidden = true;
     stopScheduler();
     nodeTracker.stopAll(); /* real reset silences everything already scheduled, not just future notes */
     armed = false;
@@ -606,6 +761,7 @@ function initStudio() {
     renderLayers();
     startScheduler();
     updateLoopTrimDisplay();
+    previewPanelEl.hidden = false;
     lockRing.style.opacity = "1";
     lockRing.classList.add("lock-ring--pulsing");
   }

@@ -251,6 +251,40 @@
   .loop-trim__label { font-size: 12px; color: var(--color-muted); }
   .loop-trim__controls { display: flex; align-items: center; gap: var(--space-2); }
   .loop-trim__value { font-family: var(--font-numeral); font-size: 14px; flex: 1; text-align: center; }
+  .loop-trim__track {
+    position: relative;
+    height: 28px;
+    background: var(--color-surface);
+    border-radius: 999px;
+    touch-action: none;
+  }
+  .loop-trim__fill {
+    position: absolute;
+    inset-inline-start: 0;
+    top: 0;
+    bottom: 0;
+    width: 0%;
+    background: color-mix(in oklab, var(--color-accent) 30%, transparent);
+    border-radius: 999px;
+    pointer-events: none;
+  }
+  .loop-trim__handle {
+    position: absolute;
+    top: 50%;
+    inset-inline-start: 0%;
+    width: 24px;
+    height: 24px;
+    margin-top: -12px;
+    margin-inline-start: -12px;
+    border-radius: 50%;
+    background: var(--gradient-accent);
+    cursor: grab;
+    box-shadow: 0 0 0 3px var(--color-surface-raised);
+  }
+  .loop-trim__handle:active { cursor: grabbing; }
+  .preview-panel { background: var(--color-surface-raised); border-radius: var(--radius); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-2); }
+  .preview-panel__controls { display: flex; align-items: center; gap: var(--space-2); }
+  .preview-panel__hint { color: var(--color-muted); font-size: 12px; }
   .layers-panel__empty { color: var(--color-muted); font-size: 14px; padding: var(--space-3) 0; }
   .layer-card { display: flex; align-items: center; gap: var(--space-2); background: var(--color-surface); border-radius: 6px; padding: var(--space-2) var(--space-3); }
   .layer-card__dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }

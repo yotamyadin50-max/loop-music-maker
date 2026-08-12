@@ -9,7 +9,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Secular+One&family=Rubik:wght@400;500;600&family=Space+Grotesk:wght@500&subset=hebrew&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=4" />
+  <link rel="stylesheet" href="style.css?v=5" />
 </head>
 <body data-page="studio">
   <header class="site-header">
@@ -54,11 +54,24 @@
       </div>
 
       <div class="loop-trim" data-loop-trim hidden>
-        <span class="loop-trim__label">אורך לופ</span>
+        <span class="loop-trim__label">אורך לופ, תגרור כדי לחתוך</span>
+        <div class="loop-trim__track" data-loop-trim-track>
+          <div class="loop-trim__fill" data-loop-trim-fill></div>
+          <div class="loop-trim__handle" data-loop-trim-handle tabindex="0" role="slider" aria-label="גרור כדי לחתוך את הלופ" aria-valuemin="0"></div>
+        </div>
         <div class="loop-trim__controls">
           <button type="button" class="btn btn--outline btn--icon" data-action="trim-shorter" aria-label="קצר את הלופ">−</button>
           <span class="loop-trim__value" data-loop-length-display>0.0 שנ'</span>
           <button type="button" class="btn btn--outline btn--icon" data-action="trim-longer" aria-label="האריך את הלופ">+</button>
+        </div>
+      </div>
+
+      <div class="preview-panel" data-preview-panel hidden>
+        <span class="loop-trim__label">תצוגה מקדימה (איך זה נשמע מהתחלה, שכבה אחרי שכבה)</span>
+        <div class="preview-panel__controls">
+          <button type="button" class="btn btn--outline btn--icon" data-action="preview-play" aria-label="נגן מההתחלה">▶</button>
+          <button type="button" class="btn btn--outline btn--icon" data-action="preview-restart" aria-label="מההתחלה">⟲</button>
+          <span class="preview-panel__hint" data-preview-hint>לחיצה על "התחל" תחזיר לעריכה רגילה</span>
         </div>
       </div>
     </aside>
@@ -74,6 +87,6 @@
     <p class="block-screen__text">הכלי הזה בנוי לשימוש בטאבלט או מחשב, המסך שלך צר מדי כרגע.</p>
   </div>
 
-  <script src="script.js?v=4"></script>
+  <script src="script.js?v=5"></script>
 </body>
 </html>
