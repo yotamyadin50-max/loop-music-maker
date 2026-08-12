@@ -247,6 +247,11 @@ function initStudio() {
   const onboarding = root.querySelector("[data-onboarding]");
   const playheadFill = root.querySelector(".playhead-track__fill");
   const armedStatus = root.querySelector("[data-armed-status]");
+  const loopTrimEl = root.querySelector("[data-loop-trim]");
+  const loopLengthDisplayEl = root.querySelector("[data-loop-length-display]");
+  const trimShorterBtn = root.querySelector("[data-action='trim-shorter']");
+  const trimLongerBtn = root.querySelector("[data-action='trim-longer']");
+  const LOOP_TRIM_STEP = 0.1;
 
   let currentInstrument = "drums";
   let armed = false;
@@ -360,6 +365,7 @@ function initStudio() {
       });
       scheduledUpToIteration = 0; /* iteration 0 already played live */
       startScheduler();
+      updateLoopTrimDisplay();
     } else {
       /* an added layer joins exactly 1 full round from now: the round in progress
          finishes as-is, the new layer plays starting the next full repeat. Chosen
@@ -390,6 +396,48 @@ function initStudio() {
     void lockRing.offsetWidth;
     setTimeout(() => lockRing.classList.add("lock-ring--pulsing"), 400);
   }
+
+  function latestNoteEnd() {
+    /* the real floor for trimming: never cut the loop shorter than its own last note, per
+       direct request to edit the length "like trimming the clip", not silently drop content. */
+    let latest = 0;
+    for (const layer of layers) {
+      for (const note of layer.notes) latest = Math.max(latest, note.time);
+    }
+    return latest;
+  }
+
+  function updateLoopTrimDisplay() {
+    if (loopLength === null) {
+      loopTrimEl.hidden = true;
+      return;
+    }
+    loopTrimEl.hidden = false;
+    loopLengthDisplayEl.textContent = loopLength.toFixed(1) + " שנ'";
+  }
+
+  function applyLoopLength(newLength) {
+    const floor = latestNoteEnd() + 0.05;
+    loopLength = Math.max(floor, Math.round(newLength * 10) / 10);
+    stopScheduler();
+    nodeTracker.stopAll();
+    loopStartTime = ensureAudio().currentTime + 0.05;
+    /* re-anchor the clock without discarding each layer's real joinIteration (still the source
+       of truth for the build-up order once saved), just let everyone already-present play
+       together immediately while actively editing. */
+    const maxJoin = layers.reduce((m, l) => Math.max(m, l.joinIteration || 0), 0);
+    scheduledUpToIteration = maxJoin - 1;
+    startScheduler();
+    updateLoopTrimDisplay();
+  }
+  trimShorterBtn.addEventListener("click", () => {
+    if (loopLength === null) return;
+    applyLoopLength(loopLength - LOOP_TRIM_STEP);
+  });
+  trimLongerBtn.addEventListener("click", () => {
+    if (loopLength === null) return;
+    applyLoopLength(loopLength + LOOP_TRIM_STEP);
+  });
 
   function startScheduler() {
     if (schedulerTimer) return;
@@ -519,6 +567,7 @@ function initStudio() {
     lockRing.classList.remove("lock-ring--pulsing");
     lockRing.style.opacity = "0";
     if (banner) banner.hidden = true;
+    updateLoopTrimDisplay();
     renderLayers();
   });
 
@@ -544,12 +593,19 @@ function initStudio() {
   function loadLoopIntoStudio(loopData) {
     stopScheduler();
     nodeTracker.stopAll();
-    layers = loopData.layers.map((l) => ({ ...l, notes: l.notes.map((n) => ({ ...n })), joinIteration: 0 }));
+    /* keep each layer's real original joinIteration (when it actually joined during recording),
+       not reset to 0: that's the exact data "הלופים שלי" now replays as the build-up order, and
+       editing/re-saving here must not silently erase it. The editor itself still hears everyone
+       together immediately (see the scheduledUpToIteration line below), only the SAVED data
+       preserves the real join order for later. */
+    layers = loopData.layers.map((l) => ({ ...l, notes: l.notes.map((n) => ({ ...n })) }));
     loopLength = loopData.loopLength;
     loopStartTime = ensureAudio().currentTime + 0.05;
-    scheduledUpToIteration = -1;
+    const maxJoin = layers.reduce((m, l) => Math.max(m, l.joinIteration || 0), 0);
+    scheduledUpToIteration = maxJoin - 1;
     renderLayers();
     startScheduler();
+    updateLoopTrimDisplay();
     lockRing.style.opacity = "1";
     lockRing.classList.add("lock-ring--pulsing");
   }
@@ -1021,31 +1077,44 @@ function initMyLoops() {
 
     let playing = false;
     let playToken = 0;
+    let resumeIteration = 0; /* where a future "play" press continues from, not always 0 */
     const playTracker = createNodeTracker();
     const playBtn = document.createElement("button");
     playBtn.className = "btn btn--outline btn--icon";
     playBtn.setAttribute("aria-label", "נגן לופ");
     playBtn.textContent = "▶";
-    playBtn.addEventListener("click", () => {
+
+    const restartBtn = document.createElement("button");
+    restartBtn.className = "btn btn--outline btn--icon";
+    restartBtn.setAttribute("aria-label", "מההתחלה");
+    restartBtn.textContent = "⟲";
+
+    function stopPlayback() {
+      playing = false;
+      playToken++;
+      playTracker.stopAll(); /* stop silences what's already scheduled, not just future notes */
+      playBtn.textContent = "▶";
+    }
+
+    /* fromIteration lets "play" mean two different things on purpose: resuming (continue from
+       resumeIteration) or restarting (always 0), per direct request for both, not just one. */
+    function startPlayback(fromIteration) {
       const ctx = ensureAudio();
-      if (playing) {
-        playing = false;
-        playToken++;
-        playTracker.stopAll(); /* pause silences what's already scheduled, not just future notes */
-        playBtn.textContent = "▶";
-        return;
-      }
       playing = true;
       playBtn.textContent = "⏸";
       const myToken = ++playToken;
       const { loopLength, layers } = entry.loop;
-      let iteration = 0;
+      let iteration = fromIteration;
       const startAt = ctx.currentTime + 0.05;
       function scheduleIteration() {
         if (myToken !== playToken) return;
-        const iterStart = startAt + iteration * loopLength;
+        resumeIteration = iteration;
+        const iterStart = startAt + (iteration - fromIteration) * loopLength;
         for (const layer of layers) {
           if (layer.muted) continue;
+          /* replays layers joining in the same real order/timing they were added during
+             recording, per direct request, not all layers flat from the first note. */
+          if (iteration < (layer.joinIteration || 0)) continue;
           for (const note of layer.notes) {
             const nodes = triggerSound(layer.instrument, note.tileIndex, iterStart + note.time, layer.gain);
             playTracker.track(layer, nodes);
@@ -1055,6 +1124,19 @@ function initMyLoops() {
         setTimeout(scheduleIteration, loopLength * 1000 - 30);
       }
       scheduleIteration();
+    }
+
+    playBtn.addEventListener("click", () => {
+      if (playing) {
+        stopPlayback();
+        return;
+      }
+      startPlayback(resumeIteration);
+    });
+    restartBtn.addEventListener("click", () => {
+      stopPlayback();
+      resumeIteration = 0;
+      startPlayback(0);
     });
 
     function buildShareUrl() {
@@ -1108,7 +1190,7 @@ function initMyLoops() {
       if (remaining.length === 0) location.reload();
     });
 
-    actions.append(playBtn, copyBtn, whatsappBtn, editBtn, delBtn);
+    actions.append(playBtn, restartBtn, copyBtn, whatsappBtn, editBtn, delBtn);
     card.append(date, label, actions);
     list.appendChild(card);
   });

@@ -9,7 +9,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Secular+One&family=Rubik:wght@400;500;600&family=Space+Grotesk:wght@500&subset=hebrew&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=3" />
+  <link rel="stylesheet" href="style.css?v=4" />
 </head>
 <body data-page="studio">
   <header class="site-header">
@@ -48,8 +48,19 @@
       </div>
     </div>
 
-    <aside class="layers-panel" data-layers-panel>
-      <p class="layers-panel__title">שכבות</p>
+    <aside class="layers-panel-wrap">
+      <div class="layers-panel" data-layers-panel>
+        <p class="layers-panel__title">שכבות</p>
+      </div>
+
+      <div class="loop-trim" data-loop-trim hidden>
+        <span class="loop-trim__label">אורך לופ</span>
+        <div class="loop-trim__controls">
+          <button type="button" class="btn btn--outline btn--icon" data-action="trim-shorter" aria-label="קצר את הלופ">−</button>
+          <span class="loop-trim__value" data-loop-length-display>0.0 שנ'</span>
+          <button type="button" class="btn btn--outline btn--icon" data-action="trim-longer" aria-label="האריך את הלופ">+</button>
+        </div>
+      </div>
     </aside>
 
     <div class="action-row">
@@ -63,6 +74,6 @@
     <p class="block-screen__text">הכלי הזה בנוי לשימוש בטאבלט או מחשב, המסך שלך צר מדי כרגע.</p>
   </div>
 
-  <script src="script.js?v=3"></script>
+  <script src="script.js?v=4"></script>
 </body>
 </html>
