@@ -6,6 +6,15 @@ const LS_LOOPS_KEY = "paama-loops-v1";
 const LS_ONBOARD_KEY = "paama-onboarding-done";
 const GRID_SIZE = 32;
 
+/* each pad's idle shade climbs from dull purple to bright turquoise across the grid, in pitch
+   order, per direct request ("כל לחצן גוון שלו לפי הסדר מהסגול הכי קהה לתכלת הכי בהיר"). Reuses
+   the same two brand colors already anchoring the rest of the palette, just interpolated per
+   pad instead of applied flat. */
+function pitchGradientColor(index, total) {
+  const pct = Math.round((index / (total - 1)) * 100);
+  return "color-mix(in oklab, var(--color-piano) " + pct + "%, var(--color-drums))";
+}
+
 let audioCtx = null;
 let noiseBuffer = null;
 
@@ -313,6 +322,7 @@ function initStudio() {
     pad.className = "pad";
     pad.setAttribute("aria-label", "פד " + (i + 1));
     pad.dataset.index = String(i);
+    pad.style.setProperty("--pad-gradient-color", pitchGradientColor(i, GRID_SIZE));
     grid.appendChild(pad);
     pads.push(pad);
   }
@@ -468,6 +478,26 @@ function initStudio() {
     return latest;
   }
 
+  /* every layer's REAL playing time is activeTo-activeFrom, not its original recorded length:
+     cutting from the start or the end shortens how often the layer itself repeats, exactly like
+     trimming a clip, per direct request ("when I cut from the end or the start it should reduce
+     the total time of that sound's own loop"). layer.length stays fixed as the outer ceiling
+     (the raw recording), never mutated, so trimming is always reversible back out to it. */
+  function effectivePeriod(layer) {
+    const to = layer.activeTo == null ? (layer.length || loopLength) : layer.activeTo;
+    return Math.max(0.05, to - (layer.activeFrom || 0));
+  }
+
+  /* layer 0 defines the master grid: keep loopLength (used for the playhead, round indicator,
+     and every other layer's join quantization) equal to layer 0's own current effective period,
+     whichever of the two trim UIs (the global panel or layer 0's own per-layer controls) just
+     changed it. */
+  function syncMasterGrid() {
+    if (!layers[0]) return;
+    loopLength = effectivePeriod(layers[0]);
+    updateLoopTrimDisplay();
+  }
+
   function updateLoopTrimDisplay() {
     if (loopLength === null) {
       loopTrimEl.hidden = true;
@@ -560,16 +590,16 @@ function initStudio() {
   }
 
   function applyLoopLength(newLength) {
-    if (newLength === null || Number.isNaN(newLength)) return;
-    const floor = latestNoteEnd() + 0.05;
-    loopLength = Math.max(floor, Math.round(newLength * 10) / 10);
-    if (layers[0]) {
-      layers[0].length = loopLength; /* layer 0 IS the master grid, keep them equal */
-      if (layers[0].activeTo > loopLength) layers[0].activeTo = loopLength;
-      if ((layers[0].activeFrom || 0) > loopLength) layers[0].activeFrom = loopLength;
-    }
+    if (newLength === null || Number.isNaN(newLength) || !layers[0]) return;
+    const from = layers[0].activeFrom || 0;
+    const floor = Math.max(0.3, latestNoteEnd() - from + 0.05);
+    const target = Math.max(floor, Math.round(newLength * 10) / 10);
+    /* this control shrinks/extends the SAME way as layer 0's own end-trim button: it cuts from
+       the end, keeping whatever start-cut is already in place, and can never extend past the
+       original recording (layer.length, the fixed ceiling). */
+    layers[0].activeTo = Math.min(layers[0].length, from + target);
+    syncMasterGrid();
     reanchorLive();
-    updateLoopTrimDisplay();
     renderLayers(); /* layer 0's own trim/length readout depends on loopLength too, keep it in sync */
   }
   trimShorterBtn.addEventListener("click", () => {
@@ -601,7 +631,7 @@ function initStudio() {
     previewPlayBtn.setAttribute("aria-label", "השהה תצוגה מקדימה");
     previewAnchor = ctx.currentTime + 0.05 - fromElapsed;
     layers.forEach((layer) => {
-      const period = layer.length || loopLength;
+      const period = effectivePeriod(layer);
       const joinAt = layer.joinAt || 0;
       const startElapsed = Math.max(joinAt, fromElapsed);
       const n = Math.ceil((startElapsed - joinAt) / period);
@@ -617,14 +647,14 @@ function initStudio() {
     previewResumeElapsed = ctx.currentTime - previewAnchor;
     for (const layer of layers) {
       if (layer.muted) continue;
-      const period = layer.length || loopLength;
+      const period = effectivePeriod(layer);
       const from = layer.activeFrom || 0;
-      const to = layer.activeTo == null ? period : Math.min(layer.activeTo, period);
+      const to = from + period;
       while (layer._previewNextCycleStart < ctx.currentTime + scheduleAhead) {
         const cycleStart = layer._previewNextCycleStart;
         for (const note of layer.notes) {
-          if (note.time < from || note.time > to) continue;
-          const when = cycleStart + note.time;
+          if (note.time < from || note.time > to) continue; /* rebased so the trimmed-in part starts at cycle position 0 */
+          const when = cycleStart + (note.time - from);
           const nodes = triggerSound(layer.instrument, note.tileIndex, when, layer.gain);
           previewTracker.track(layer, nodes);
           const delayMs = Math.max(0, (when - ctx.currentTime) * 1000);
@@ -710,14 +740,14 @@ function initStudio() {
     for (const layer of layers) {
       if (layer.muted) continue;
       if (layer._nextCycleStart === undefined) layer._nextCycleStart = loopStartTime + (layer.joinAt || 0);
-      const period = layer.length || loopLength;
+      const period = effectivePeriod(layer);
       const from = layer.activeFrom || 0;
-      const to = layer.activeTo == null ? period : Math.min(layer.activeTo, period);
+      const to = from + period;
       while (layer._nextCycleStart < ctx.currentTime + scheduleAhead) {
         const cycleStart = layer._nextCycleStart;
         for (const note of layer.notes) {
           if (note.time < from || note.time > to) continue; /* trimmed off this layer's own start/end */
-          const when = cycleStart + note.time;
+          const when = cycleStart + (note.time - from); /* rebased so the trimmed-in part starts at cycle position 0 */
           const nodes = triggerSound(layer.instrument, note.tileIndex, when, layer.gain);
           nodeTracker.track(layer, nodes);
           const delayMs = Math.max(0, (when - ctx.currentTime) * 1000);
@@ -840,12 +870,14 @@ function initStudio() {
       startMinus.addEventListener("click", () => {
         layer.activeFrom = Math.max(0, Math.round(((layer.activeFrom || 0) - TRIM_STEP) * 10) / 10);
         refreshTrimValues();
+        syncMasterGrid();
         reanchorLive();
       });
       startPlus.addEventListener("click", () => {
         const maxFrom = Math.max(0, currentTo() - TRIM_STEP);
         layer.activeFrom = Math.min(maxFrom, Math.round(((layer.activeFrom || 0) + TRIM_STEP) * 10) / 10);
         refreshTrimValues();
+        syncMasterGrid();
         reanchorLive();
       });
       startGroup.append(startLabel, startMinus, startValue, startPlus);
@@ -869,12 +901,14 @@ function initStudio() {
         const next = Math.min(layerPeriod(), Math.round((currentTo() + TRIM_STEP) * 10) / 10);
         layer.activeTo = next;
         refreshTrimValues();
+        syncMasterGrid();
         reanchorLive();
       });
       endPlus.addEventListener("click", () => {
         const minTo = Math.min(layerPeriod(), (layer.activeFrom || 0) + TRIM_STEP);
         layer.activeTo = Math.max(minTo, Math.round((currentTo() - TRIM_STEP) * 10) / 10);
         refreshTrimValues();
+        syncMasterGrid();
         reanchorLive();
       });
       endGroup.append(endLabel, endMinus, endValue, endPlus);
@@ -982,6 +1016,7 @@ function initStudio() {
        order and each layer's own independent length for later. */
     layers = loopData.layers.map((l) => ({ ...l, notes: l.notes.map((n) => ({ ...n })) }));
     loopLength = loopData.loopLength;
+    syncMasterGrid(); /* re-derive from layer 0's own activeFrom/activeTo, don't just trust the saved number */
     loopStartTime = ensureAudio().currentTime; /* placeholder so reanchorLive's null-guard passes; it overwrites this */
     reanchorLive();
     renderLayers();
@@ -1230,6 +1265,7 @@ function initLessons() {
       const pad = document.createElement("button");
       pad.type = "button";
       pad.className = "pad";
+      pad.style.setProperty("--pad-gradient-color", pitchGradientColor(i, GRID_SIZE));
       pad.addEventListener("pointerdown", () => onPracticeTap(i));
       gridEl.appendChild(pad);
       pads.push(pad);
@@ -1483,6 +1519,13 @@ function initMyLoops() {
        so a single shared "iteration" number can't describe playback position across all of
        them. fromElapsed lets "play" mean two different things on purpose: resuming (continue
        from resumeElapsed) or restarting (always 0), per direct request for both, not just one. */
+    /* a layer's real playing time is activeTo-activeFrom, not its recorded length: cutting from
+       the start or end shortens how often it repeats, same as Studio's own trim controls. */
+    function effectivePeriod(layer, loopLength) {
+      const to = layer.activeTo == null ? (layer.length || loopLength) : layer.activeTo;
+      return Math.max(0.05, to - (layer.activeFrom || 0));
+    }
+
     function startPlayback(fromElapsed) {
       const ctx = ensureAudio();
       playing = true;
@@ -1490,7 +1533,7 @@ function initMyLoops() {
       const { loopLength, layers } = entry.loop;
       playAnchor = ctx.currentTime + 0.05 - fromElapsed;
       layers.forEach((layer) => {
-        const period = layer.length || loopLength;
+        const period = effectivePeriod(layer, loopLength);
         const joinAt = layer.joinAt || 0;
         const startElapsed = Math.max(joinAt, fromElapsed);
         const n = Math.ceil((startElapsed - joinAt) / period);
@@ -1505,14 +1548,14 @@ function initMyLoops() {
           if (layer.muted) continue;
           /* replays layers joining in the same real order/timing they were added during
              recording, per direct request, not all layers flat from the first note. */
-          const period = layer.length || loopLength;
+          const period = effectivePeriod(layer, loopLength);
           const from = layer.activeFrom || 0;
-          const to = layer.activeTo == null ? period : Math.min(layer.activeTo, period);
+          const to = from + period;
           while (layer._myNextCycleStart < c.currentTime + scheduleAhead) {
             const cycleStart = layer._myNextCycleStart;
             for (const note of layer.notes) {
               if (note.time < from || note.time > to) continue;
-              const nodes = triggerSound(layer.instrument, note.tileIndex, cycleStart + note.time, layer.gain);
+              const nodes = triggerSound(layer.instrument, note.tileIndex, cycleStart + (note.time - from), layer.gain);
               playTracker.track(layer, nodes);
             }
             layer._myNextCycleStart += period;
