@@ -252,6 +252,7 @@
   .layers-panel-wrap { grid-column: 1; display: flex; flex-direction: column; gap: var(--space-3); align-self: start; }
   .layers-panel { background: var(--color-surface-raised); border-radius: var(--radius); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-2); max-height: 60vh; overflow-y: auto; }
   .layers-panel__title { font-size: 14px; color: var(--color-muted); margin-bottom: var(--space-2); }
+  .layers-panel__hint { font-size: 12px; color: var(--color-muted); padding: 0 var(--space-1); }
   .loop-trim { background: var(--color-surface-raised); border-radius: var(--radius); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-2); }
   .loop-trim__label { font-size: 12px; color: var(--color-muted); }
   .loop-trim__controls { display: flex; align-items: center; gap: var(--space-2); }

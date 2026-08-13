@@ -269,6 +269,7 @@ function initStudio() {
   const currentRoundEl = root.querySelector("[data-current-round]");
   const instrumentBtns = root.querySelectorAll("[data-instrument]");
   const layersPanel = root.querySelector("[data-layers-panel]");
+  const layersHintEl = root.querySelector("[data-layers-hint]");
   const saveBtn = root.querySelector("[data-action='save']");
   const restartBtn = root.querySelector("[data-action='restart']");
   const lockRing = root.querySelector(".lock-ring");
@@ -760,6 +761,9 @@ function initStudio() {
 
   function renderLayers() {
     layerCountEl.textContent = String(layers.length);
+    /* a friend opening a shared link lands straight in this panel with zero context for what
+       the per-layer trim/join controls do, so a short standing hint once real content exists. */
+    if (layersHintEl) layersHintEl.hidden = layers.length === 0;
     layersPanel.innerHTML = "";
     if (layers.length === 0) {
       const empty = document.createElement("p");
