@@ -181,6 +181,9 @@ function migrateLoopLayers(loopData) {
   if (!loopData || !Array.isArray(loopData.layers)) return loopData;
   const masterLength = loopData.loopLength;
   loopData.layers.forEach((layer) => {
+    if (!layer || typeof layer !== "object") return; /* a null/non-object entry is nonsense
+      isValidLoopData will reject outright; don't throw here and skip the whole load before it
+      gets the chance (was masking real corruption behind a silent, toast-less failure). */
     if (layer.length == null) layer.length = masterLength;
     if (layer.joinAt == null) layer.joinAt = (layer.joinIteration || 0) * masterLength;
     if (layer.activeFrom == null) layer.activeFrom = 0;
@@ -189,19 +192,35 @@ function migrateLoopLayers(loopData) {
   return loopData;
 }
 
-/* a hand-edited, truncated, or otherwise corrupted ?share= link can decode to syntactically
-   valid JSON that's still nonsense (missing loopLength, an empty layers array, a layer missing
-   its own notes, an out-of-range tileIndex). Loading that unchecked doesn't just fail loudly:
-   NaN/undefined periods silently stop a scheduler tick forever with no error, and a bad
-   tileIndex throws inside a setInterval that then re-throws every tick. Reject it up front with
-   one visible message instead of a silently-broken or permanently-crashing loop. */
+/* a hand-edited, truncated, or otherwise corrupted ?share= link (or a hand-tampered localStorage
+   entry) can decode to syntactically valid JSON that's still nonsense (missing loopLength, an
+   empty layers array, a layer missing its own notes, an out-of-range tileIndex, a non-numeric
+   activeFrom/activeTo). Loading that unchecked doesn't just fail loudly: NaN/undefined periods
+   silently stop a scheduler tick forever with no error, and a bad tileIndex throws inside a
+   setInterval that then re-throws every tick. Reject it up front with one visible message
+   instead of a silently-broken or permanently-crashing loop. */
+/* an hour is far beyond anything a real recording produces (the join-round UI itself caps at
+   32 master-grid rounds), but stays a plain number check rather than guessing at "reasonable":
+   without SOME bound, a huge joinAt survives Number.isFinite and sends the live scheduler's
+   catch-up while-loop (layer._nextCycleStart += period, one step at a time) into billions of
+   synchronous iterations trying to close the gap — a real tab-freeze from a single bad link. */
+const MAX_SANE_SECONDS = 3600;
+
 function isValidLoopData(loopData) {
   if (!loopData || !Array.isArray(loopData.layers) || loopData.layers.length === 0) return false;
-  if (typeof loopData.loopLength !== "number" || !(loopData.loopLength > 0)) return false;
+  if (typeof loopData.loopLength !== "number" || !(loopData.loopLength > 0) || loopData.loopLength > MAX_SANE_SECONDS) return false;
   return loopData.layers.every(
     (l) =>
       l &&
       typeof l.instrument === "string" &&
+      Number.isFinite(l.length) &&
+      l.length > 0 &&
+      l.length <= MAX_SANE_SECONDS &&
+      Number.isFinite(l.activeFrom) &&
+      Number.isFinite(l.activeTo) &&
+      Number.isFinite(l.joinAt) &&
+      l.joinAt >= 0 &&
+      l.joinAt <= MAX_SANE_SECONDS &&
       Array.isArray(l.notes) &&
       l.notes.every((n) => Number.isInteger(n.tileIndex) && n.tileIndex >= 0 && n.tileIndex < GRID_SIZE && typeof n.time === "number")
   );
@@ -211,7 +230,10 @@ function loadAllLoops() {
   try {
     const list = JSON.parse(localStorage.getItem(LS_LOOPS_KEY) || "[]");
     list.forEach((entry) => migrateLoopLayers(entry.loop));
-    return list;
+    /* filter through the same validation share-link loading uses: one hand-tampered or
+       stale-format entry used to throw mid-loop and silently blank the whole "הלופים שלי"
+       page for every OTHER saved loop too, not just the bad one. */
+    return list.filter((entry) => isValidLoopData(entry.loop));
   } catch (e) {
     return [];
   }
@@ -318,6 +340,18 @@ function initStudio() {
   let playheadTimer = null;
   let layers = []; // { instrument, notes:[{tileIndex,time}], muted, gain, length, joinAt, activeFrom, activeTo }
   let pendingTaps = []; // for the layer currently being recorded
+  /* rebuilt fresh on every renderLayers() call: lets a master-grid-only change (editing layer
+     0's own trim, or the global loop-trim panel) refresh every OTHER layer's displayed numbers
+     without tearing down and rebuilding the whole panel — that used to detach whatever card the
+     user's focus/pointer was on, and rebound every listener, for a change to a handful of
+     text values. */
+  let layerRefreshers = [];
+  function refreshAllLayerDisplays() {
+    layerRefreshers.forEach((r) => {
+      r.refreshTrim();
+      if (r.refreshJoin) r.refreshJoin();
+    });
+  }
   let editingLoopId = null;
   const nodeTracker = createNodeTracker(); // keyed by layer object, so mute/delete/restart can silence what's already scheduled
 
@@ -628,7 +662,7 @@ function initStudio() {
     layers[0].activeTo = Math.min(layers[0].length, from + target);
     syncMasterGrid();
     reanchorLive();
-    renderLayers(); /* layer 0's own trim/length readout depends on loopLength too, keep it in sync */
+    refreshAllLayerDisplays(); /* layer 0's own trim readout, and every other layer's join-round number, both depend on loopLength */
   }
   trimShorterBtn.addEventListener("click", () => {
     if (loopLength === null) return;
@@ -639,13 +673,16 @@ function initStudio() {
     applyLoopLength(loopLength + LOOP_TRIM_STEP);
   });
 
-  function stopPreviewPlayback() {
+  function stopPreviewPlayback(resuming) {
     previewPlaying = false;
     if (previewTimer) clearInterval(previewTimer);
     previewTimer = null;
     previewTracker.stopAll();
     previewPlayBtn.textContent = "▶";
-    previewPlayBtn.setAttribute("aria-label", "נגן מההתחלה");
+    /* a pause (resuming=true) and a real stop (restart/exit/delete) leave the button in the
+       same visual state but mean different things on the next click — say so, for anyone using
+       a screen reader rather than watching the icon. */
+    previewPlayBtn.setAttribute("aria-label", resuming ? "המשך תצוגה מקדימה" : "נגן מההתחלה");
   }
 
   /* look-ahead scheduler, same shape as the live one below: each layer can have its own
@@ -681,8 +718,10 @@ function initStudio() {
       /* defensive: a layer with no _previewNextCycleStart (e.g. pushed while preview was
          somehow already running) would otherwise compare undefined < number, always false,
          and stay silently unscheduled forever with no self-heal, unlike the live scheduler
-         below which already guards this. */
-      if (layer._previewNextCycleStart === undefined) layer._previewNextCycleStart = ctx.currentTime;
+         below which already guards this. Seed from its real join offset, same as schedulerTick
+         does with loopStartTime + joinAt, not just "now" — dropping the offset would silently
+         start the layer immediately instead of at its true position in the build-up order. */
+      if (layer._previewNextCycleStart === undefined) layer._previewNextCycleStart = previewAnchor + (layer.joinAt || 0);
       while (layer._previewNextCycleStart < ctx.currentTime + scheduleAhead) {
         const cycleStart = layer._previewNextCycleStart;
         for (const note of layer.notes) {
@@ -721,7 +760,7 @@ function initStudio() {
       enterPreview();
       return;
     }
-    if (previewPlaying) stopPreviewPlayback();
+    if (previewPlaying) stopPreviewPlayback(true);
     else startPreviewPlayback(previewResumeElapsed);
   });
   previewRestartBtn.addEventListener("click", () => {
@@ -798,6 +837,7 @@ function initStudio() {
        the per-layer trim/join controls do, so a short standing hint once real content exists. */
     if (layersHintEl) layersHintEl.hidden = layers.length === 0;
     layersPanel.innerHTML = "";
+    layerRefreshers = []; /* every card built below re-registers itself; a full rebuild starts clean */
     if (layers.length === 0) {
       const empty = document.createElement("p");
       empty.className = "layers-panel__empty";
@@ -875,15 +915,40 @@ function initStudio() {
           previewPanelEl.hidden = true;
           previewHintEl.hidden = true;
           stopScheduler();
+          nodeTracker.stopAll();
+          armed = false; /* matches "התחל מחדש": if a new layer was mid-recording when the last
+            existing one got deleted, its taps are relative to a now-defunct clock */
+          pendingTaps = [];
           loopStartTime = null;
           loopLength = null;
+          trimMax = 4;
           editingLoopId = null;
+          enterLoopBtn.disabled = true;
+          root.querySelector(".transport").classList.remove("transport--armed");
+          if (armedStatus) armedStatus.hidden = true;
+          updateInstrumentLock();
           lockRing.classList.remove("lock-ring--pulsing");
           lockRing.style.opacity = "0";
           if (banner) banner.hidden = true;
           updateLoopTrimDisplay();
         } else {
+          if (i === 0) {
+            /* the deleted layer WAS the master grid's own origin (joinAt always 0); whichever
+               layer is now layers[0] doesn't know it's "the master" yet — its own joinAt is
+               still whatever real offset it joined at as a non-master layer. Reconcile phase,
+               not just period: shift the master clock forward by that offset, and shift every
+               surviving layer's joinAt back by the same amount, so each layer's real moment in
+               time (loopStartTime + joinAt) is unchanged — only the coordinate origin moves. */
+            const shift = layers[0].joinAt || 0;
+            if (shift > 0) {
+              loopStartTime += shift;
+              layers.forEach((l) => {
+                l.joinAt = Math.max(0, Math.round(((l.joinAt || 0) - shift) * 100) / 100);
+              });
+            }
+          }
           syncMasterGrid(); /* whichever layer is now layers[0] (possibly a different one, if index 0 was deleted) defines the master grid */
+          reanchorLive(); /* same rule every other live edit follows: drops back to normal editing (exits preview if active) and re-syncs the live scheduler to the shift above */
         }
         renderLayers();
       });
@@ -917,6 +982,7 @@ function initStudio() {
         lengthValue.textContent = Math.max(0, currentTo() - (layer.activeFrom || 0)).toFixed(1) + " שנ'";
       }
       refreshTrimValues();
+      let refreshJoinValue = null; /* only layers with a join-round control (i > 0) reassign this below */
 
       /* the resulting playing time of THIS layer's own loop, after both trims: a plain readout,
          no +/- of its own since it's fully derived from the start/end cuts above, per direct
@@ -949,7 +1015,7 @@ function initStudio() {
         refreshTrimValues();
         syncMasterGrid();
         reanchorLive();
-        if (i === 0) renderLayers(); /* trimming the master grid changes loopLength, which every other layer's own displayed "מצטרף בסיבוב" round number depends on */
+        if (i === 0) refreshAllLayerDisplays(); /* trimming the master grid changes loopLength, which every other layer's own displayed "מצטרף בסיבוב" round number depends on */
       });
       startPlus.addEventListener("click", () => {
         const maxFrom = Math.max(0, currentTo() - TRIM_STEP);
@@ -957,7 +1023,7 @@ function initStudio() {
         refreshTrimValues();
         syncMasterGrid();
         reanchorLive();
-        if (i === 0) renderLayers();
+        if (i === 0) refreshAllLayerDisplays();
       });
       startGroup.append(startLabel, startMinus, startValue, startPlus);
 
@@ -982,7 +1048,7 @@ function initStudio() {
         refreshTrimValues();
         syncMasterGrid();
         reanchorLive();
-        if (i === 0) renderLayers();
+        if (i === 0) refreshAllLayerDisplays();
       });
       endPlus.addEventListener("click", () => {
         const minTo = Math.min(layerPeriod(), (layer.activeFrom || 0) + TRIM_STEP);
@@ -990,7 +1056,7 @@ function initStudio() {
         refreshTrimValues();
         syncMasterGrid();
         reanchorLive();
-        if (i === 0) renderLayers();
+        if (i === 0) refreshAllLayerDisplays();
       });
       endGroup.append(endLabel, endMinus, endValue, endPlus);
       trimRow.append(startGroup, endGroup);
@@ -1022,9 +1088,9 @@ function initStudio() {
         joinPlus.className = "btn btn--outline btn--icon layer-card__trim-btn";
         joinPlus.textContent = "+";
         joinPlus.setAttribute("aria-label", "הצטרף מאוחר יותר, " + name.textContent);
-        function refreshJoinValue() {
+        refreshJoinValue = function () {
           joinValue.textContent = String(Math.round((layer.joinAt || 0) / loopLength));
-        }
+        };
         refreshJoinValue();
         joinMinus.addEventListener("click", () => {
           layer.joinAt = Math.max(0, Math.round(((layer.joinAt || 0) - loopLength) * 100) / 100);
@@ -1040,6 +1106,7 @@ function initStudio() {
         trimRow.append(joinGroup);
       }
 
+      layerRefreshers.push({ refreshTrim: refreshTrimValues, refreshJoin: refreshJoinValue });
       card.append(topRow, trimRow);
       layersPanel.appendChild(card);
     });
@@ -1058,6 +1125,7 @@ function initStudio() {
     armed = false;
     loopStartTime = null;
     loopLength = null;
+    trimMax = 4; /* the drag track's scale only ever grows to fit a longer loop; without resetting it here, a new short loop after a long one inherits an oversized, imprecise scale */
     layers = [];
     pendingTaps = [];
     editingLoopId = null;
@@ -1118,18 +1186,6 @@ function initStudio() {
     return true;
   }
 
-  function showToast(text) {
-    let toast = document.querySelector(".toast");
-    if (!toast) {
-      toast = document.createElement("div");
-      toast.className = "toast";
-      document.body.appendChild(toast);
-    }
-    toast.textContent = text;
-    toast.classList.add("toast--visible");
-    setTimeout(() => toast.classList.remove("toast--visible"), 2600);
-  }
-
   function dismissOnboarding(which, force) {
     if (!onboarding || onboarding.hidden) return;
     if (force || localStorage.getItem(LS_ONBOARD_KEY)) {
@@ -1150,7 +1206,12 @@ function initStudio() {
   const params = new URLSearchParams(location.search);
   if (params.has("share")) {
     const decoded = decodeLoop(params.get("share"));
-    if (decoded && loadLoopIntoStudio(decoded) && banner) {
+    if (!decoded) {
+      /* the more likely real-world corruption (a link truncated by copy/paste or a messaging
+         app) fails right here, before isValidLoopData ever gets a chance to explain anything —
+         give the same visible feedback instead of a silent blank studio. */
+      showToast("הקישור פגום, אי אפשר לטעון את הלופ הזה.");
+    } else if (loadLoopIntoStudio(decoded) && banner) {
       banner.hidden = false;
       banner.textContent = "נטען לופ ששותף איתך. אפשר להמשיך לבנות עליו.";
     }
@@ -1158,9 +1219,11 @@ function initStudio() {
     const id = params.get("edit");
     const all = loadAllLoops();
     const found = all.find((l) => l.id === id);
-    if (found) {
+    /* only claim this editing session once the load actually succeeds: setting editingLoopId
+       first and having the load silently fail meant a later save would overwrite the original
+       (still-intact) stored entry with an unrelated fresh recording. */
+    if (found && loadLoopIntoStudio(found.loop)) {
       editingLoopId = id;
-      loadLoopIntoStudio(found.loop);
     }
   }
 }
@@ -1511,7 +1574,7 @@ function initLessons() {
     const encoded = encodeLoop(loopData);
     openStudioBtn.href = "studio.html?share=" + encoded;
     openStudioBtn.hidden = false;
-    showListToast(
+    showToast(
       lesson.backing
         ? "נוסף! שני הכלים ביחד. תלחץ \"פתח בסטודיו\" כדי להמשיך לבנות עליו."
         : "נוסף! תלחץ \"פתח בסטודיו\" כדי להמשיך לבנות עליו."
@@ -1640,7 +1703,7 @@ function initMyLoops() {
           const period = effectivePeriod(layer, loopLength);
           const from = layer.activeFrom || 0;
           const to = from + period;
-          if (layer._myNextCycleStart === undefined) layer._myNextCycleStart = c.currentTime; /* defensive, matches the live/preview engines' own guard */
+          if (layer._myNextCycleStart === undefined) layer._myNextCycleStart = playAnchor + (layer.joinAt || 0); /* defensive: seed from its real join offset, not just "now" — matches schedulerTick's own guard */
           while (layer._myNextCycleStart < c.currentTime + scheduleAhead) {
             const cycleStart = layer._myNextCycleStart;
             for (const note of layer.notes) {
@@ -1683,7 +1746,7 @@ function initMyLoops() {
         /* clipboard may be unavailable; fall back to prompt */
         window.prompt("העתק את הקישור:", url);
       }
-      showListToast("הקישור הועתק. אפשר לשלוח לחבר.");
+      showToast("הקישור הועתק. אפשר לשלוח לחבר.");
     });
 
     /* a real, standard wa.me share intent, not a fake "share" button, matches this system's own
@@ -1727,7 +1790,7 @@ function initMyLoops() {
   });
 }
 
-function showListToast(text) {
+function showToast(text) {
   let toast = document.querySelector(".toast");
   if (!toast) {
     toast = document.createElement("div");
