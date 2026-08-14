@@ -209,6 +209,12 @@ const MAX_SANE_SECONDS = 3600;
 function isValidLoopData(loopData) {
   if (!loopData || !Array.isArray(loopData.layers) || loopData.layers.length === 0) return false;
   if (typeof loopData.loopLength !== "number" || !(loopData.loopLength > 0) || loopData.loopLength > MAX_SANE_SECONDS) return false;
+  /* layer 0 is the master grid's own origin everywhere else in the app (created with joinAt: 0,
+     and every join-quantization/playhead/round-indicator assumes it stays 0) — reject external
+     data that violates this instead of silently loading a loop whose "master" layer starts
+     late. Live editing wouldn't show the problem (reanchorLive ignores joinAt while editing);
+     only a save+replay would, so catching it here beats a hard-to-diagnose report later. */
+  if (!loopData.layers[0] || (loopData.layers[0].joinAt || 0) !== 0) return false;
   return loopData.layers.every(
     (l) =>
       l &&
@@ -217,23 +223,42 @@ function isValidLoopData(loopData) {
       l.length > 0 &&
       l.length <= MAX_SANE_SECONDS &&
       Number.isFinite(l.activeFrom) &&
+      l.activeFrom >= 0 &&
+      l.activeFrom <= MAX_SANE_SECONDS &&
       Number.isFinite(l.activeTo) &&
+      l.activeTo >= 0 &&
+      l.activeTo <= MAX_SANE_SECONDS &&
       Number.isFinite(l.joinAt) &&
       l.joinAt >= 0 &&
       l.joinAt <= MAX_SANE_SECONDS &&
+      /* gain is optional (older/simpler data omits it, and every reader already treats
+         null/undefined as "1" — see renderLayers()'s volume slider), but if present it must be
+         a real, non-negative number: it flows straight into a Web Audio gain ramp, and Infinity/
+         NaN there throws inside the scheduler the same way a bad tileIndex or time does. */
+      (l.gain == null || (Number.isFinite(l.gain) && l.gain >= 0)) &&
       Array.isArray(l.notes) &&
-      l.notes.every((n) => Number.isInteger(n.tileIndex) && n.tileIndex >= 0 && n.tileIndex < GRID_SIZE && typeof n.time === "number")
+      l.notes.every(
+        (n) => n && Number.isInteger(n.tileIndex) && n.tileIndex >= 0 && n.tileIndex < GRID_SIZE && Number.isFinite(n.time) && n.time >= 0 && n.time <= MAX_SANE_SECONDS
+      )
   );
 }
 
+/* deliberately returns the RAW list (migrated, but not filtered): saveBtn and My Loops'
+   delBtn both do load-all → modify one entry → save-all, and this function backs that
+   round-trip. Filtering out an unrelated invalid entry here would make it vanish from storage
+   the next time the user saves or deletes ANY loop, not just when they touch the bad one —
+   found via review, an early version of this function did exactly that. Filtering for DISPLAY
+   (so one corrupted entry doesn't crash "הלופים שלי") belongs at the read site that renders,
+   not here. */
 function loadAllLoops() {
   try {
     const list = JSON.parse(localStorage.getItem(LS_LOOPS_KEY) || "[]");
-    list.forEach((entry) => migrateLoopLayers(entry.loop));
-    /* filter through the same validation share-link loading uses: one hand-tampered or
-       stale-format entry used to throw mid-loop and silently blank the whole "הלופים שלי"
-       page for every OTHER saved loop too, not just the bad one. */
-    return list.filter((entry) => isValidLoopData(entry.loop));
+    /* a null/non-object list entry has no loop data to preserve (unlike an entry whose loop
+       merely fails isValidLoopData, which still has real content and is kept raw above), and
+       dereferencing .loop on it would throw and take the whole list down with it. */
+    const usable = list.filter((entry) => entry && typeof entry === "object");
+    usable.forEach((entry) => migrateLoopLayers(entry.loop));
+    return usable;
   } catch (e) {
     return [];
   }
@@ -637,11 +662,14 @@ function initStudio() {
        layer 0 (the master grid) also restarts its cycle right here. */
     if (loopStartTime === null) return;
     if (previewMode) {
-      /* any live edit (trim, join round, loop length) drops back to normal editing, same rule
-         as "התחל": preview and the live editing engine must never both be scheduling at once,
-         or notes double up. */
+      /* any live edit (trim, join round, loop length, delete) drops back to normal editing,
+         same rule as "התחל": preview and the live editing engine must never both be scheduling
+         at once, or notes double up. Hide the preview-only hint here too, not just in
+         exitPreview() — this teardown is reachable directly (e.g. from the delete-layer
+         handler) without going through exitPreview() at all. */
       previewMode = false;
       stopPreviewPlayback();
+      previewHintEl.hidden = true;
     }
     stopScheduler();
     nodeTracker.stopAll();
@@ -910,45 +938,35 @@ function initStudio() {
              that no longer exists. Found via testing: delete-the-only-layer then record a new
              one produced a nonzero joinAt against a stale loopStartTime. Same reset as "התחל
              מחדש", minus the confirm (deleting the last layer one at a time already was it). */
-          stopPreviewPlayback();
-          previewMode = false;
-          previewPanelEl.hidden = true;
-          previewHintEl.hidden = true;
-          stopScheduler();
-          nodeTracker.stopAll();
-          armed = false; /* matches "התחל מחדש": if a new layer was mid-recording when the last
-            existing one got deleted, its taps are relative to a now-defunct clock */
-          pendingTaps = [];
-          loopStartTime = null;
-          loopLength = null;
-          trimMax = 4;
-          editingLoopId = null;
-          enterLoopBtn.disabled = true;
-          root.querySelector(".transport").classList.remove("transport--armed");
-          if (armedStatus) armedStatus.hidden = true;
-          updateInstrumentLock();
-          lockRing.classList.remove("lock-ring--pulsing");
-          lockRing.style.opacity = "0";
-          if (banner) banner.hidden = true;
-          updateLoopTrimDisplay();
-        } else {
-          if (i === 0) {
-            /* the deleted layer WAS the master grid's own origin (joinAt always 0); whichever
-               layer is now layers[0] doesn't know it's "the master" yet — its own joinAt is
-               still whatever real offset it joined at as a non-master layer. Reconcile phase,
-               not just period: shift the master clock forward by that offset, and shift every
-               surviving layer's joinAt back by the same amount, so each layer's real moment in
-               time (loopStartTime + joinAt) is unchanged — only the coordinate origin moves. */
-            const shift = layers[0].joinAt || 0;
-            if (shift > 0) {
-              loopStartTime += shift;
-              layers.forEach((l) => {
-                l.joinAt = Math.max(0, Math.round(((l.joinAt || 0) - shift) * 100) / 100);
-              });
-            }
+          resetStudioToBlank();
+        } else if (i === 0) {
+          /* only the master-layer case needs any of this: deleting a non-master layer changes
+             nothing about the grid or anyone else's timing (they keep scheduling exactly as
+             before), so skip straight past syncMasterGrid()/reanchorLive() below for that case —
+             both would otherwise recompute values that didn't change and force an audible
+             stop-everything-and-reschedule for an edit that only removed one unrelated layer. */
+          /* the deleted layer WAS the master grid's own origin (joinAt always 0); whichever
+             layer joined earliest among the survivors doesn't know it's "the master" yet — its
+             own joinAt is still whatever real offset it joined at as a non-master layer.
+             Reconcile phase, not just period: shift every surviving layer's joinAt back by that
+             earliest offset so each layer's real moment in time (the old loopStartTime +
+             joinAt) is unchanged — only the coordinate origin moves. Using the MINIMUM joinAt
+             among survivors, not just layers[0]'s own value: per-layer join-round editing can
+             leave an earlier array index with a LATER joinAt than a layer behind it, and using
+             the wrong one would zero out the wrong layer. Re-sort by joinAt afterward so
+             whichever layer actually lands on 0 is truly layers[0] — everything else (the join
+             UI being hidden only for index 0, isValidLoopData requiring layers[0].joinAt === 0)
+             depends on that. loopStartTime itself doesn't need adjusting here: the
+             reanchorLive() call right below resets it to "now" unconditionally anyway. */
+          const shift = Math.min(...layers.map((l) => l.joinAt || 0));
+          if (shift > 0) {
+            layers.forEach((l) => {
+              l.joinAt = Math.max(0, Math.round(((l.joinAt || 0) - shift) * 100) / 100);
+            });
           }
-          syncMasterGrid(); /* whichever layer is now layers[0] (possibly a different one, if index 0 was deleted) defines the master grid */
-          reanchorLive(); /* same rule every other live edit follows: drops back to normal editing (exits preview if active) and re-syncs the live scheduler to the shift above */
+          layers.sort((a, b) => (a.joinAt || 0) - (b.joinAt || 0));
+          syncMasterGrid();
+          reanchorLive(); /* same rule every other live edit follows: drops back to normal editing (exits preview if active) and re-syncs the live scheduler */
         }
         renderLayers();
       });
@@ -1098,7 +1116,7 @@ function initStudio() {
           reanchorLive();
         });
         joinPlus.addEventListener("click", () => {
-          layer.joinAt = Math.min(32 * loopLength, (layer.joinAt || 0) + loopLength);
+          layer.joinAt = Math.min(32 * loopLength, Math.round(((layer.joinAt || 0) + loopLength) * 100) / 100);
           refreshJoinValue();
           reanchorLive();
         });
@@ -1113,9 +1131,10 @@ function initStudio() {
   }
   renderLayers();
 
-  restartBtn.addEventListener("click", async () => {
-    const ok = await confirmDialog("למחוק הכל ולהתחיל מאפס?");
-    if (!ok) return;
+  /* the "everything back to a blank slate" reset: shared by "התחל מחדש" and by deleting the
+     last remaining layer one at a time, since both land in exactly the same state and used to
+     drift apart (round 2 found the delete path was missing several of these resets). */
+  function resetStudioToBlank() {
     stopPreviewPlayback();
     previewMode = false;
     previewPanelEl.hidden = true;
@@ -1137,6 +1156,12 @@ function initStudio() {
     lockRing.style.opacity = "0";
     if (banner) banner.hidden = true;
     updateLoopTrimDisplay();
+  }
+
+  restartBtn.addEventListener("click", async () => {
+    const ok = await confirmDialog("למחוק הכל ולהתחיל מאפס?");
+    if (!ok) return;
+    resetStudioToBlank();
     renderLayers();
   });
 
@@ -1596,7 +1621,10 @@ function initLessons() {
 function initMyLoops() {
   const list = document.querySelector("[data-loops-list]");
   if (!list) return;
-  const all = loadAllLoops();
+  /* filter for DISPLAY only: one hand-tampered or stale-format entry used to throw mid-render
+     and blank this whole page for every OTHER saved loop too. loadAllLoops() itself stays raw
+     so a save/delete round-trip never silently drops an unrelated entry from storage. */
+  const all = loadAllLoops().filter((entry) => isValidLoopData(entry.loop));
 
   if (all.length === 0) {
     const example = document.createElement("div");
